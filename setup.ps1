@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "=== Realtime Call Translator — Windows Setup ===" -ForegroundColor Cyan
+Write-Host "=== Realtime Call Translator - Windows Setup ===" -ForegroundColor Cyan
 
 # 1. Check for Package Manager (Winget is default on Win10/11)
 if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -31,6 +31,7 @@ foreach ($dep in $dependencies.GetEnumerator()) {
 # 3. Install Rust
 if (!(Get-Command rustc -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Rust..." -ForegroundColor Yellow
+    # Download and install rustup
     Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile "rustup-init.exe"
     Start-Process "rustup-init.exe" -ArgumentList "-y --default-toolchain stable" -Wait
     Remove-Item "rustup-init.exe"
@@ -50,23 +51,13 @@ if (!(Test-Path ".venv")) {
 & .\.venv\Scripts\pip install -r requirements.txt
 Write-Host "Python packages installed." -ForegroundColor Green
 
-# 5. VB-Cable Reminder
-Write-Host ""
-Write-Host "--- IMPORTANT: AUDIO ROUTING ---" -ForegroundColor Cyan
-Write-Host "To make the translator work in calls, you MUST install VB-Cable:" -ForegroundColor White
-Write-Host "1. Download from: https://vb-audio.com/Cable/" -ForegroundColor White
-Write-Host "2. In your call app (Meet/Zoom):" -ForegroundColor White
-Write-Host "   - Microphone -> VB-Cable Output" -ForegroundColor White
-Write-Host "   - Speakers -> VB-Cable Input" -ForegroundColor White
-Write-Host ""
-
-# 6. Environment File
+# 5. Environment File
 if (!(Test-Path ".env")) {
     Copy-Item ".env.example" ".env"
     Write-Host ".env created from template. Please edit it with your API keys." -ForegroundColor Yellow
 }
 
-# 7. Build Project
+# 6. Build Project
 Write-Host "Building project..." -ForegroundColor Yellow
 mix deps.get
 mix compile
