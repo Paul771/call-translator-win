@@ -1,21 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Cross-platform run script for macOS and Windows (WSL/PowerShell)
 cd "$(dirname "$0")"
-source .env
-export DEEPGRAM_API_KEY GROQ_API_KEY ORT_DYLIB_PATH
 
-# Activate venv if it exists
-if [ -d ".venv" ]; then
-  source .venv/bin/activate
+# Load environment variables from .env file
+if [ -f ".env" ]; then
+  set -a
+  source .env
+  set +a
 fi
 
-# Start Flask web UI in background
-python3 web.py &
-FLASK_PID=$!
+# Activate venv if it exists
+if [ -d ".venv" ] && [ -f ".venv/bin/activate" ]; then
+  source .venv/bin/activate
+elif [ -d ".venv" ] && [ -f ".venv\Scripts\activate.bat" ]; then
+  # Windows path
+  echo "Windows: Run '.venv\Scripts\activate' in PowerShell first"
+  exit 1
+fi
 
-# Cleanup on exit
+# Start Flask web UI in background (cross-platform)
+if command -v python3 &>/dev/null; then
+  python3 web.py &
+  FLASK_PID=$!
+elif command -v python &>/dev/null; then
+  python web.py &
+  FLASK_PID=$!
+else
+  echo "Error: Python not found"
+  exit 1
+fi
+
+# Cleanup on exit (cross-platform)
 cleanup() {
-  kill $FLASK_PID 2>/dev/null
-  pkill -f "audio_engine" 2>/dev/null
+  # Kill Flask process
+  if [ -n "$FLASK_PID" ]; then
+    kill $FLASK_PID 2>/dev/null || true
+  fi
+  
+  # Kill audio_engine processes (cross-platform)
+  pkill -f "audio_engine" 2>/dev/null || taskkill /F /IM audio_engine.exe 2>/dev/null || true
+  
   exit 0
 }
 trap cleanup EXIT INT TERM

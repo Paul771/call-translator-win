@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Windows-compatible setup script with fallback for Chocolatey/winget
 set -e
 
 echo "=== Realtime Call Translator — Setup ==="

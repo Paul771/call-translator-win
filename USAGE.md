@@ -9,8 +9,10 @@ Settings open automatically on first launch. Fill in:
 1. **API Keys** — enter your [Deepgram](https://console.deepgram.com) and [Groq](https://console.groq.com) keys, click **Test** to verify
 2. **Languages** — set "My Language" (what you speak) and "Their Language" (what the other person speaks)
 3. **Voice** — pick a TTS voice for each language. One default voice is pre-installed; download more from the dropdown
-4. **Audio Devices** — select your mic and speakers. BlackHole devices are configured automatically
+4. **Audio Devices** — select your mic and speakers
 5. Click **Save & Restart Engine**
+
+   - On Windows: no special configuration needed — WASAPI handles routing automatically
 
 ## Controls
 
@@ -19,7 +21,7 @@ Settings open automatically on first launch. Fill in:
 | **Start / Stop** | Start or stop the translation engine. A call session is recorded between Start and Stop |
 | **Mic Out** | Mute/unmute your microphone (outgoing translation) |
 | **Mic In** | Mute/unmute incoming audio (their speech) |
-| **Tab Audio** | Capture audio from a browser tab instead of BlackHole. Useful when you can't install BlackHole |
+| **Tab Audio** | Capture audio from a browser tab directly — no external drivers needed |
 | **Monitor** | Play translated audio in the browser so you can hear what the other person will hear |
 | **Compact** | Toggle compact chat mode — smaller bubbles, less spacing |
 | **Saved** | Filter to show only bookmarked messages |
@@ -60,14 +62,19 @@ Click **History** to see past call sessions:
 
 ## Audio Setup for Calls
 
-For Google Meet, Zoom, or any call app:
-
+**macOS:**
 1. Install [BlackHole](https://existential.audio/blackhole/) (both 2ch and 16ch)
 2. In your call app, set **BlackHole 2ch** as microphone
 3. In your call app, set **BlackHole 16ch** as speakers
 4. Use **Google Chrome** for the call app — Safari has audio limitations
 
 The translator automatically routes audio through BlackHole: your translated speech goes to the call, their speech comes back for translation.
+
+**Windows:**
+No additional drivers needed! The project uses WASAPI directly:
+1. Set your desired microphone as the default input device
+2. Set your speakers/headphones as the default output device
+3. No virtual routing required — audio flows directly between devices
 
 ## Keyboard Shortcuts
 

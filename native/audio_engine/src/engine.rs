@@ -62,9 +62,9 @@ impl EngineConfig {
             speaker_device: std::env::var("TRANSLATOR_SPEAKER_DEVICE")
                 .unwrap_or_else(|_| "default".into()),
             meet_input_device: std::env::var("TRANSLATOR_MEET_INPUT")
-                .unwrap_or_else(|_| "BlackHole 16ch".into()),
+                .unwrap_or_else(|_| "default".into()),
             meet_output_device: std::env::var("TRANSLATOR_MEET_OUTPUT")
-                .unwrap_or_else(|_| "BlackHole 2ch".into()),
+                .unwrap_or_else(|_| "default".into()),
             sample_rate: std::env::var("TRANSLATOR_SAMPLE_RATE")
                 .ok()
                 .and_then(|s| s.parse().ok())

@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     // Initialize ONNX Runtime (required for load-dynamic feature).
     // Must be called before any ort::Session creation (TTS Piper).
     let ort_dylib = std::env::var("ORT_DYLIB_PATH")
-        .unwrap_or_else(|_| "/opt/homebrew/lib/libonnxruntime.dylib".into());
+        .unwrap_or_else(|_| "/usr/local/lib/onnxruntime.dll".into());
     ort::init_from(&ort_dylib)
         .expect("Failed to load ONNX Runtime dylib")
         .commit();

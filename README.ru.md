@@ -11,7 +11,10 @@
 ![macOS](https://img.shields.io/badge/platform-macOS_14+-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-> **Внимание:** только macOS (14+). Использует CoreAudio и cpal для захвата аудио. Поддержка Windows/Linux пока отсутствует — принимаем контрибуции!
+> **Платформы:** macOS 14+, Windows 10/11, Linux
+> - macOS: Использует CoreAudio и cpal для захвата аудио
+> - Windows: Использует WASAPI через cpal (автоматически)
+> - Linux: Использует PulseAudio/JACK через cpal
 
 ---
 
@@ -65,18 +68,15 @@ cd call-translator
 
 ## Требования
 
-| Зависимость | Назначение | Установка |
-|---|---|---|
-| macOS 14+ | CoreAudio для аудио I/O | — |
-| [Homebrew](https://brew.sh) | Пакетный менеджер | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` |
-| Elixir | Рантайм приложения | `brew install elixir` |
-| Rust | Аудио-движок | `brew install rustup && rustup-init` |
-| Python 3 | Веб-сервер UI | `brew install python@3` |
-| espeak-ng | Фонемизация для TTS | `brew install espeak-ng` |
-| ONNX Runtime | Инференс моделей | `brew install onnxruntime` |
-| Flask | Веб-фреймворк | через venv (см. ниже) |
-| [BlackHole](https://existential.audio/blackhole/) | Виртуальная маршрутизация аудио | Скачать вручную |
-| Xcode CLT | C-компилятор для Rust | `xcode-select --install` |
+| Зависимость | Назначение | Установка (macOS) | Установка (Windows) |
+|---|---|---|---|
+| Elixir | Рантайм приложения | `brew install elixir` | [Chocolatey](https://chocolatey.org/packages/elixir): `choco install elixir` |
+| Rust | Аудио-движок | `rustup init` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | rustup init` |
+| Python 3 | Веб-сервер UI | `brew install python@3` | [Python.org](https://python.org) или winget: `winget install Python.Python.3` |
+| espeak-ng | Фонемизация для TTS | `brew install espeak-ng` | winget: `winget install espeak-ng` |
+| ONNX Runtime | Инференс моделей | `brew install onnxruntime` | winget или скачать с [Microsoft](https://learn.microsoft.com/en-us/azure/machine-learning/reference/onnx-runtime)
+| Flask | Веб-фреймворк | через venv (см. ниже) | через venv (то же, что на macOS) |
+| WASAPI | Аудио I/O | N/A | Встроено в Windows
 
 **API-ключи (есть бесплатные тарифы):**
 - [Deepgram](https://console.deepgram.com) — распознавание речи (модель Nova-3)
@@ -90,6 +90,7 @@ cd call-translator
 
 ### 1. Системные пакеты
 
+**macOS:**
 ```bash
 xcode-select --install
 brew install elixir rustup espeak-ng onnxruntime python@3
@@ -102,20 +103,42 @@ source .venv/bin/activate
 pip install flask
 ```
 
-### 2. Аудио-драйвер BlackHole
+**Windows:**
+```powershell
+# Установка через winget (рекомендуется)
+winget install Elixir.Elixir
+rustup-init -y --default-toolchain stable
+winget install Python.Python.3
+winget install espeak-ng
 
-Скачайте и установите с [existential.audio/blackhole](https://existential.audio/blackhole/).
+# ИЛИ использовать Chocolatey:
+choco install elixir rust python espeak-ng onnxruntime
 
-Нужны **оба**:
-- **BlackHole 16ch** — захватывает аудио из приложения для звонков (Google Meet, Zoom и т.д.)
-- **BlackHole 2ch** — отправляет переведённое аудио обратно в звонок
+# Виртуальное окружение и Flask
+python -m venv .venv
+.venv\Scripts\activate
+pip install flask
+```
 
-Настройка в приложении для звонков (Google Meet, Zoom и т.д.):
-1. Откройте звонок в **Google Chrome** (не Safari)
-2. Установите **BlackHole 2ch** как **микрофон** в приложении для звонков
-3. Установите **BlackHole 16ch** как **динамики** в приложении для звонков
+### 2. Настройка аудио
 
-> **Важно:** НЕ используйте Multi-Output Device — это может вызвать проблемы со звуком. Устанавливайте устройства BlackHole напрямую в настройках приложения для звонков.
+**macOS (BlackHole):**
+1. Скачайте и установите [BlackHole](https://existential.audio/blackhole/)
+2. Нужны **оба**:
+   - **BlackHole 16ch** — захватывает аудио из приложения для звонков
+   - **BlackHole 2ch** — отправляет переведённое аудио обратно в звонок
+3. Настройка в приложении для звонков (Google Meet, Zoom и т.д.):
+   - Откройте звонок в **Google Chrome**
+   - Установите **BlackHole 2ch** как **микрофон** в приложении для звонков
+   - Установите **BlackHole 16ch** как **динамики** в приложении для звонков
+
+> **Важно:** НЕ используйте Multi-Output Device — это может вызвать проблемы со звуком.
+
+**Windows (WASAPI):**
+Дополнительные драйверы не нужны! Проект использует WASAPI напрямую через cpal:
+1. Установите нужный микрофон как устройство ввода по умолчанию
+2. Установите свои динамики/наушники как устройство вывода по умолчанию
+3. Дополнительная виртуальная маршрутизация не требуется — аудио передаётся напрямую между устройствами
 
 ### 3. Голосовые модели
 
@@ -142,17 +165,32 @@ curl -sL https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ru/ru_RU/den
 Все доступные голоса: [rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/).
 
 ### 4. Переменные окружения
-
 ```bash
 cp .env.example .env
 ```
 
 Отредактируйте `.env`:
 
+**macOS:**
 ```
 DEEPGRAM_API_KEY=ваш_ключ
 GROQ_API_KEY=ваш_ключ
 ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib
+```
+
+**Windows:**
+```powershell
+copy .env.example .env
+# Отредактируйте .env с вашими API-ключами:
+DEEPGRAM_API_KEY=ваш_ключ
+GROQ_API_KEY=ваш_ключ
+# Путь к DLL ONNX Runtime (отрегулируйте, если установлена в другом месте)
+ORT_DYLIB_PATH=C:\ProgramData\chocolatey\lib\onnxruntime\bin\onnxruntime.dll
+```
+
+Или установите `ORT_DYLIB_PATH` через переменную окружения в PowerShell:
+```powershell
+$env:ORT_DYLIB_PATH = "C:\ProgramData\chocolatey\lib\onnxruntime\bin\onnxruntime.dll"
 ```
 
 ### 5. Сборка

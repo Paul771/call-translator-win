@@ -28,25 +28,84 @@ impl AudioPlayback {
             .name()
             .unwrap_or_else(|_| "unknown".into());
 
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Fixed(960), // 20ms at 48kHz
-        };
-
-        info!(
-            "Opening playback device '{}' with config: rate={}, channels={}, buffer=960",
-            actual_name, sample_rate, config.channels
-        );
-
+        // Windows WASAPI often requires specific sample rates.
+        // We try to find the closest supported config to the requested sample_rate.
         let supported = device
             .supported_output_configs()
             .context("Failed to query supported output configs")?;
 
-        debug!("Supported output configs for '{}':", actual_name);
-        for cfg in supported {
-            debug!("  {:?}", cfg);
-        }
+        let config = supported
+            .filter(|cfg| cfg.sample_rate().0 == sample_rate && cfg.channels() == 1)
+            .next()
+            .or_else(|| {
+                debug!("Exact config ({}Hz, 1ch) not found, using default", sample_rate);
+                device.default_output_config().ok()
+            })
+            .context("No compatible output configuration found for this device")?;
+
+        let actual_sample_rate = config.sample_rate().0;
+        let channels = config.channels();
+
+        info!(
+            "Opening playback device '{}': rate={}Hz, channels={}",
+            actual_name, actual_sample_rate, channels
+        );
+
+        // Ring buffer: 10 seconds
+        let ring_size = actual_sample_rate as usize * 10;
+        let ring = HeapRb::<f32>::new(ring_size);
+        let (mut producer, mut consumer) = ring.split();
+
+        let feeder_name = actual_name.clone();
+        let feeder = std::thread::Builder::new()
+            .name(format!("playback-feeder-{}", feeder_name))
+            .spawn(move || {
+                debug!("Playback feeder thread started for '{}'", feeder_name);
+                loop {
+                    match receiver.recv() {
+                        Ok(samples) => {
+                            for &sample in &samples {
+                                let _ = producer.try_push(sample);
+                            }
+                        }
+                        Err(_) => {
+                            debug!("Playback feeder: channel disconnected, stopping");
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("Failed to spawn playback feeder thread")?;
+
+        let stream = device
+            .build_output_stream(
+                &config,
+                move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    let filled = consumer.pop_slice(data);
+                    if filled < data.len() {
+                        for sample in &mut data[filled..] {
+                            *sample = 0.0;
+                        }
+                    }
+                },
+                move |err| {
+                    error!("Playback stream error: {}", err);
+                },
+                None,
+            )
+            .context("Failed to build output stream")?;
+
+        Ok(Self {
+            stream,
+            _device_name: actual_name,
+            _config: StreamConfig {
+                channels,
+                sample_rate: config.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            },
+            _feeder: feeder,
+        })
+    }
 
         // Ring buffer: 10 seconds — enough for long TTS phrases
         let ring_size = sample_rate as usize * 10;

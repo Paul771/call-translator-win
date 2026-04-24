@@ -12,33 +12,47 @@ Supports **29 languages** with STT, translation, and TTS. Voice models from [Pip
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![GitHub stars](https://img.shields.io/github/stars/LetovKai/call-translator)
 
-> **Note:** macOS only (14+). Uses CoreAudio and cpal for audio capture. Windows/Linux support is not available yet — contributions welcome!
+> **Platforms:** macOS 14+, Windows 10/11, Linux
+> - macOS: Uses CoreAudio and cpal for audio capture
+> - Windows: Uses WASAPI via cpal (automatic)
+> - Linux: Uses PulseAudio/JACK via cpal
 
 ---
 
 ## Quick Start
 
-**One-command setup** (macOS with Homebrew):
-
+**macOS:**
 ```bash
 git clone https://github.com/LetovKai/call-translator.git
 cd call-translator
 ./setup.sh
 ```
 
-The script installs all dependencies, downloads voice models for English and Russian, and builds the project.
-
 Then:
-
 ```bash
 ./run.sh
 ```
+
+**Windows:**
+1. **Install VB-Cable** (Critical for audio routing):
+   - Download and install from [vb-audio.com/Cable/](https://vb-audio.com/Cable/)
+2. **Run Setup**:
+   - Open PowerShell as Administrator and run:
+     ```powershell
+     Set-ExecutionPolicy RemoteSigned -Scope Process
+     .\setup.ps1
+     ```
+3. **Run Application**:
+   - Open a terminal (Bash/WSL/Git Bash) and run:
+     ```bash
+     ./run.sh
+     ```
 
 Open **http://127.0.0.1:5050** in **Google Chrome**. Settings open automatically on first launch — enter your API keys and configure languages there.
 
 **[Usage Guide (USAGE.md)](USAGE.md)** — controls, voice management, audio setup, call history.
 
-> **Browser:** Use **Chrome** — audio monitor and BlackHole routing work correctly. Safari has audio output limitations that prevent monitor playback. Other browsers are untested.
+> **Browser:** Use **Chrome** — audio monitor works correctly on all platforms. Safari has audio output limitations that prevent monitor playback. Other browsers are untested.
 
 > You need two free API keys (free tiers available):
 > - [Deepgram](https://console.deepgram.com) — speech-to-text
@@ -68,18 +82,15 @@ Open **http://127.0.0.1:5050** in **Google Chrome**. Settings open automatically
 
 ## Requirements
 
-| Dependency | Purpose | Install |
-|---|---|---|
-| macOS 14+ | CoreAudio for audio I/O | — |
-| [Homebrew](https://brew.sh) | Package manager | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` |
-| Elixir | Application runtime | `brew install elixir` |
-| Rust | Audio engine | `brew install rustup && rustup-init` |
-| Python 3 | Web UI server | `brew install python@3` |
-| espeak-ng | TTS phonemization | `brew install espeak-ng` |
-| ONNX Runtime | Model inference | `brew install onnxruntime` |
-| Flask | Web framework | via venv (see below) |
-| [BlackHole](https://existential.audio/blackhole/) | Virtual audio routing | Manual download |
-| Xcode CLT | C compiler for Rust | `xcode-select --install` |
+| Dependency | Purpose | Install (macOS) | Install (Windows) |
+|---|---|---|---|
+| Elixir | Application runtime | `brew install elixir` | [Chocolatey](https://chocolatey.org/packages/elixir): `choco install elixir` |
+| Rust | Audio engine | `rustup init` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | rustup init` |
+| Python 3 | Web UI server | `brew install python@3` | [Python.org](https://python.org) or winget: `winget install Python.Python.3` |
+| espeak-ng | TTS phonemization | `brew install espeak-ng` | winget: `winget install espeak-ng` |
+| ONNX Runtime | Model inference | `brew install onnxruntime` | winget or download from [Microsoft](https://learn.microsoft.com/en-us/azure/machine-learning/reference/onnx-runtime)
+| Flask | Web framework | via venv (see below) | via venv (same as macOS) |
+| WASAPI | Audio I/O | N/A | Built into Windows
 
 **API Keys (free tiers available):**
 - [Deepgram](https://console.deepgram.com) — speech-to-text (Nova-3 model)
@@ -93,6 +104,7 @@ If you prefer to install everything step by step instead of using `setup.sh`:
 
 ### 1. System packages
 
+**macOS:**
 ```bash
 xcode-select --install
 brew install elixir rustup espeak-ng onnxruntime python@3
@@ -105,20 +117,42 @@ source .venv/bin/activate
 pip install flask
 ```
 
-### 2. BlackHole audio driver
+**Windows:**
+```powershell
+# Install via winget (recommended)
+winget install Elixir.Elixir
+rustup-init -y --default-toolchain stable
+winget install Python.Python.3
+winget install espeak-ng
 
-Download and install from [existential.audio/blackhole](https://existential.audio/blackhole/).
+# OR use Chocolatey:
+choco install elixir rust python espeak-ng onnxruntime
 
-You need **both**:
-- **BlackHole 16ch** — captures audio from your call app (Google Meet, Zoom, etc.)
-- **BlackHole 2ch** — sends translated audio back to the call
+# Create virtual environment and install Flask
+python -m venv .venv
+.venv\Scripts\activate
+pip install flask
+```
 
-Setup in your call app (Google Meet, Zoom, etc.):
-1. Open the call in **Google Chrome** (not Safari)
-2. Set **BlackHole 2ch** as the **microphone** in the call app
-3. Set **BlackHole 16ch** as the **speakers** in the call app
+### 2. Audio setup
 
-> **Note:** Do NOT use a Multi-Output Device — it may cause audio issues. Set BlackHole devices directly in the call app settings.
+**macOS (BlackHole):**
+1. Download and install [BlackHole](https://existential.audio/blackhole/)
+2. You need **both**:
+   - **BlackHole 16ch** — captures audio from your call app
+   - **BlackHole 2ch** — sends translated audio back to the call
+3. Setup in your call app (Google Meet, Zoom, etc.):
+   - Open the call in **Google Chrome**
+   - Set **BlackHole 2ch** as the **microphone** in the call app
+   - Set **BlackHole 16ch** as the **speakers** in the call app
+
+> **Note:** Do NOT use a Multi-Output Device — it may cause audio issues.
+
+**Windows (WASAPI):**
+No additional drivers needed! The project uses WASAPI directly through cpal:
+1. Set your desired microphone as the default input device
+2. Set your speakers/headphones as the default output device
+3. No virtual routing required — audio flows directly between devices
 
 ### 3. Download voice models
 
@@ -145,9 +179,32 @@ curl -sL https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ru/ru_RU/den
 Browse all available voices at [rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/).
 
 ### 4. Environment variables
-
 ```bash
 cp .env.example .env
+```
+
+Edit `.env`:
+
+**macOS:**
+```
+DEEPGRAM_API_KEY=your_key_here
+GROQ_API_KEY=your_key_here
+ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib
+```
+
+**Windows:**
+```powershell
+copy .env.example .env
+# Edit .env with your API keys:
+DEEPGRAM_API_KEY=your_key_here
+GROQ_API_KEY=your_key_here
+# ONNX Runtime DLL location (adjust if installed elsewhere)
+ORT_DYLIB_PATH=C:\ProgramData\chocolatey\lib\onnxruntime\bin\onnxruntime.dll
+```
+
+Or set `ORT_DYLIB_PATH` via environment variable in PowerShell:
+```powershell
+$env:ORT_DYLIB_PATH = "C:\ProgramData\chocolatey\lib\onnxruntime\bin\onnxruntime.dll"
 ```
 
 Edit `.env`:

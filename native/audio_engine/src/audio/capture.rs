@@ -21,6 +21,7 @@ impl AudioCapture {
     /// Uses the device's default configuration (sample rate + channels) to guarantee
     /// compatibility across different devices (built-in mic, headphones, etc.).
     /// Audio is downmixed to mono before sending.
+    // ... existing code ...
     pub fn new(device_name: &str, sender: Sender<AudioChunk>) -> Result<Self> {
         let device = find_input_device(device_name)?;
         let actual_name = device.name().unwrap_or_else(|_| "unknown".into());
@@ -43,6 +44,8 @@ impl AudioCapture {
             actual_name, sample_rate, channels
         );
 
+        // On Windows, we use the provided config. Some devices might require 
+        // specific sample rates or buffer sizes.
         let stream = device
             .build_input_stream(
                 &config,
@@ -67,6 +70,7 @@ impl AudioCapture {
 
         Ok(Self { stream, device_name: actual_name, sample_rate })
     }
+    // ... existing code ...
 
     pub fn start(&self) -> Result<()> {
         self.stream.play().context("Failed to start capture stream")?;
