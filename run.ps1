@@ -16,7 +16,7 @@ if (Test-Path ".env") {
         if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
             $key = $matches[1].Trim()
             $value = $matches[2].Trim()
-            Set-Item -Path "ENV:$key" -Value $value
+            [Environment]::SetEnvironmentVariable($key, $value, "Process")
         }
     }
 } else {
@@ -34,11 +34,16 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
 
 # Start Flask web UI in background
 Write-Host "Starting Flask web UI..." -ForegroundColor Yellow
-$flaskProcess = Start-Process python -ArgumentList "web.py" -PassThru -WindowStyle Hidden
+$flaskStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+$flaskStartInfo.FileName = "python"
+$flaskStartInfo.Arguments = "web.py"
+$flaskStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$flaskStartInfo.UseShellExecute = $true
+$flaskProcess = [System.Diagnostics.Process]::Start($flaskStartInfo)
 Write-Host "Flask started (PID: $($flaskProcess.Id))" -ForegroundColor Green
 
 # Wait for Flask to start
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 
 # Cleanup function
 function Cleanup {
@@ -46,27 +51,26 @@ function Cleanup {
     
     # Stop Flask process
     if ($flaskProcess -and !$flaskProcess.HasExited) {
-        Stop-Process -Id $flaskProcess.Id -Force
+        Stop-Process -Id $flaskProcess.Id -Force -ErrorAction SilentlyContinue
     }
     
     # Stop audio_engine processes
-    Get-Process | Where-Object { $_.Name -like "*audio_engine*" } | Stop-Process -Force
+    Get-Process | Where-Object { $_.Name -like "*audio_engine*" -or $_.Name -like "*erl*" } | 
+        Stop-Process -Force -ErrorAction SilentlyContinue
     
     # Restore original directory
     Set-Location $originalDir
     
     Write-Host "Shutdown complete." -ForegroundColor Yellow
-    exit 0
 }
 
 # Register cleanup on exit
-Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup } | Out-Null
-Ctrl+C { Cleanup }
-Ctrl+Break { Cleanup }
+$null = Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup } -Force
 
 # Start Elixir application
 Write-Host "Starting Elixir application..." -ForegroundColor Yellow
 Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
+Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 
 # Define the evaluation code for Elixir
 $evalCode = @'
@@ -82,14 +86,26 @@ spawn(fn ->
 end)
 '@
 
-# Run Elixir with mix
 try {
-    # Note: This requires Elixir to be in PATH
+    # Run Elixir with mix in interactive mode
     $elixirArgs = @("--eval", $evalCode, "-S", "mix", "run", "--no-halt")
-    & elixir $elixirArgs
+    
+    # Use Start-Process for better control
+    $elixirStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $elixirStartInfo.FileName = "elixir"
+    $elixirStartInfo.Arguments = ($elixirArgs | ForEach-Object { "`"$_`" " }) -join ' '
+    $elixirStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+    $elixirStartInfo.UseShellExecute = $true
+    $elixirProcess = [System.Diagnostics.Process]::Start($elixirStartInfo)
+    
+    # Wait for Elixir process
+    while (!$elixirProcess.HasExited) {
+        Start-Sleep -Milliseconds 500
+    }
 } catch {
     Write-Error "Failed to start Elixir application: $_"
     Cleanup
+    exit 1
 }
 
 Cleanup
