@@ -43,7 +43,11 @@ Then:
      .\setup.ps1
      ```
 3. **Run Application**:
-   - Open a terminal (Bash/WSL/Git Bash) and run:
+   - **Option A (Recommended)**: Run the PowerShell script:
+     ```powershell
+     .\run.ps1
+     ```
+   - **Option B**: Use Git Bash:
      ```bash
      ./run.sh
      ```

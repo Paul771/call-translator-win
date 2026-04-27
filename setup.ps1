@@ -65,6 +65,8 @@ mix compile
 Write-Host ""
 Write-Host "=== Setup Complete! ===" -ForegroundColor Green
 Write-Host "Next steps:"
-Write-Host "1. Edit .env with your API keys"
-Write-Host "2. Run: ./run.sh (or use a bash emulator/WSL)"
+Write-Host "1. Edit .env with your API keys (copy .env.example to .env)"
+Write-Host "2. Run the application:"
+Write-Host "   - Option A (Recommended): .\run.ps1"
+Write-Host "   - Option B (Git Bash): ./run.sh"
 Write-Host "3. Open: http://127.0.0.1:5050"
