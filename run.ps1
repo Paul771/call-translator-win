@@ -32,7 +32,7 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
     exit 1
 }
 
-# Start Flask web UI in background
+# Start Flask web UI
 Write-Host "Starting Flask web UI..." -ForegroundColor Yellow
 $flaskStartInfo = New-Object System.Diagnostics.ProcessStartInfo
 $flaskStartInfo.FileName = "python"
@@ -51,12 +51,17 @@ function Cleanup {
     
     # Stop Flask process
     if ($flaskProcess -and !$flaskProcess.HasExited) {
-        Stop-Process -Id $flaskProcess.Id -Force -ErrorAction SilentlyContinue
+        try {
+            Stop-Process -Id $flaskProcess.Id -Force -ErrorAction SilentlyContinue
+        } catch {}
     }
     
-    # Stop audio_engine processes
-    Get-Process | Where-Object { $_.Name -like "*audio_engine*" -or $_.Name -like "*erl*" } | 
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop audio_engine and Erlang processes
+    Get-Process | Where-Object { 
+        $_.Name -like "*audio_engine*" -or 
+        $_.Name -like "*erl*" -or
+        $_.Name -like "*beam*"
+    } | Stop-Process -Force -ErrorAction SilentlyContinue
     
     # Restore original directory
     Set-Location $originalDir
@@ -64,13 +69,13 @@ function Cleanup {
     Write-Host "Shutdown complete." -ForegroundColor Yellow
 }
 
-# Register cleanup on exit
-$null = Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup } -Force
+# Register cleanup handlers
+$null = Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup }
 
 # Start Elixir application
 Write-Host "Starting Elixir application..." -ForegroundColor Yellow
 Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
-Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
+Write-Host "Press Ctrl+C to stop the application" -ForegroundColor Yellow
 
 # Define the evaluation code for Elixir
 $evalCode = @'
@@ -87,20 +92,31 @@ end)
 '@
 
 try {
-    # Run Elixir with mix in interactive mode
-    $elixirArgs = @("--eval", $evalCode, "-S", "mix", "run", "--no-halt")
+    # Run Elixir with mix
+    $elixirArgs = "--eval `"$evalCode`" -S mix run --no-halt"
     
-    # Use Start-Process for better control
+    Write-Host "Starting Elixir with args: $elixirArgs" -ForegroundColor Gray
+    
+    # Start Elixir process
     $elixirStartInfo = New-Object System.Diagnostics.ProcessStartInfo
     $elixirStartInfo.FileName = "elixir"
-    $elixirStartInfo.Arguments = ($elixirArgs | ForEach-Object { "`"$_`" " }) -join ' '
+    $elixirStartInfo.Arguments = $elixirArgs
     $elixirStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
     $elixirStartInfo.UseShellExecute = $true
     $elixirProcess = [System.Diagnostics.Process]::Start($elixirStartInfo)
     
-    # Wait for Elixir process
+    # Wait for Elixir process to exit
     while (!$elixirProcess.HasExited) {
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 1000
+        
+        # Check if we need to exit
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq 'C' -and $key.Modifiers -eq [ConsoleModifiers]::Control) {
+                Write-Host "`nCtrl+C detected, shutting down..." -ForegroundColor Yellow
+                break
+            }
+        }
     }
 } catch {
     Write-Error "Failed to start Elixir application: $_"
@@ -108,4 +124,6 @@ try {
     exit 1
 }
 
+# Cleanup and exit
 Cleanup
+exit 0
