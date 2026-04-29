@@ -40,7 +40,7 @@ $flaskStartInfo.Arguments = "web.py"
 $flaskStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
 $flaskStartInfo.UseShellExecute = $true
 $flaskProcess = [System.Diagnostics.Process]::Start($flaskStartInfo)
-Write-Host "Flask started (PID: $($flaskProcess.Id))" -ForegroundColor Green
+Write-Host "Flask started (PID: $($flaskStartInfo.Id))" -ForegroundColor Green
 
 # Wait for Flask to start
 Start-Sleep -Seconds 3
@@ -51,17 +51,11 @@ function Cleanup {
     
     # Stop Flask process
     if ($flaskProcess -and !$flaskProcess.HasExited) {
-        try {
-            Stop-Process -Id $flaskProcess.Id -Force -ErrorAction SilentlyContinue
-        } catch {}
+        Stop-Process -Id $flaskProcess.Id -Force -ErrorAction SilentlyContinue
     }
     
-    # Stop audio_engine and Erlang processes
-    Get-Process | Where-Object { 
-        $_.Name -like "*audio_engine*" -or 
-        $_.Name -like "*erl*" -or
-        $_.Name -like "*beam*"
-    } | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop audio_engine processes
+    Get-Process | Where-Object { $_.Name -like "*audio_engine*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     
     # Restore original directory
     Set-Location $originalDir
@@ -69,27 +63,14 @@ function Cleanup {
     Write-Host "Shutdown complete." -ForegroundColor Yellow
 }
 
-# Register cleanup handlers
-$null = Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup }
-
 # Start Elixir application
 Write-Host "Starting Elixir application..." -ForegroundColor Yellow
 Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
-Write-Host "Press Ctrl+C to stop the application" -ForegroundColor Yellow
-
-# Check if elixir is available
-try {
-    $elixirPath = (Get-Command elixir -ErrorAction Stop).Source
-    Write-Host "Found Elixir at: $elixirPath" -ForegroundColor Gray
-} catch {
-    Write-Error "Elixir not found in PATH. Please ensure Elixir is installed."
-    Write-Host "Install with: winget install Elixir.Elixir" -ForegroundColor Yellow
-    Cleanup
-    exit 1
-}
+Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 
 # Define the evaluation code for Elixir
-$evalCode = 'spawn(fn ->
+$evalCode = @'
+spawn(fn ->
   wait = fn wait, n ->
     case Process.whereis(Translator.AudioEngine) do
       nil when n > 0 -> Process.sleep(100); wait.(wait, n - 1)
@@ -98,51 +79,18 @@ $evalCode = 'spawn(fn ->
     end
   end
   wait.(wait, 300)
-end)'
+end)
+'@
 
+# Run Elixir with mix
 try {
-    # Run Elixir with mix using iex
-    Write-Host "Starting Elixir with mix..." -ForegroundColor Gray
-    
-    # Use iex to run the application
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = "iex"
-    $startInfo.Arguments = "--eval `"$evalCode`" -S mix run --no-halt"
-    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
-    $startInfo.UseShellExecute = $true
-    $startInfo.WorkingDirectory = (Get-Location).Path
-    
-    $elixirProcess = [System.Diagnostics.Process]::Start($startInfo)
-    
-    if ($null -eq $elixirProcess) {
-        throw "Failed to start Elixir process"
-    }
-    
-    Write-Host "Elixir process started (PID: $($elixirProcess.Id))" -ForegroundColor Green
-    
-    # Wait for Elixir process to exit
-    while (!$elixirProcess.HasExited) {
-        Start-Sleep -Milliseconds 1000
-        
-        # Check if we need to exit
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true)
-            if ($key.Key -eq 'C' -and $key.Modifiers -eq [ConsoleModifiers]::Control) {
-                Write-Host "`nCtrl+C detected, shutting down..." -ForegroundColor Yellow
-                break
-            }
-        }
-    }
+    # Note: This requires Elixir to be in PATH
+    $elixirArgs = @("--eval", $evalCode, "-S", "mix", "run", "--no-halt")
+    & elixir $elixirArgs
 } catch {
     Write-Error "Failed to start Elixir application: $_"
-    Write-Host "`nTroubleshooting:" -ForegroundColor Yellow
-    Write-Host "1. Check if Elixir is installed: elixir --version" -ForegroundColor Yellow
-    Write-Host "2. Check if Mix is installed: mix --version" -ForegroundColor Yellow
-    Write-Host "3. Try running: iex -S mix run --no-halt" -ForegroundColor Yellow
     Cleanup
     exit 1
 }
 
-# Cleanup and exit
 Cleanup
-exit 0
