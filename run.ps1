@@ -6,10 +6,10 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== Realtime Call Translator - Starting ===" -ForegroundColor Cyan
 
 # Change to script directory
-Set-Location -Path C:\Users\Pavel\AppData\Roaming\npm\call-translator-win
+Set-Location -Path $PSScriptRoot
 
 # Load environment variables from .env file
-if (Test-Process ".env") {
+if (Test-Path ".env" -PathType Leaf) {
     Write-Host "Loading environment variables from .env..." -ForegroundColor Yellow
     $envContent = Get-Content ".env"
     $envContent | ForEach-Object {
@@ -49,7 +49,7 @@ function Cleanup {
         $_.Name -like "*audio_engine*" -or 
         $_.Name -like "*erl*" -or
         $_.Name -like "*beam*"
-    } | Stop-Process
+    } | Stop-Process -Force
 }
 
 # Register cleanup handler
