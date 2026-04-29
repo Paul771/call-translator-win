@@ -10,7 +10,6 @@ Set-Location -Path $PSScriptRoot
 
 # Load environment variables from .env file
 if (Test-Path ".env" -PathType Leaf) {
-    Write-Host "Loading environment variables from .env..." -ForegroundColor Yellow
     $envContent = Get-Content ".env"
     $envContent | ForEach-Object {
         if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
@@ -59,6 +58,18 @@ Write-Host "Starting Elixir application..." -ForegroundColor Green
 Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 
+# Define the evaluation code for Elixir
+$evalCode = 'spawn(fn ->
+  wait = fn wait, n ->
+    case Process.whereis(Translator.AudioEngine) do
+      nil when n > 0 -> Process.sleep(100); wait.(wait, n - 1)
+      nil -> IO.puts("AudioEngine not started after 30s")
+      _pid -> IO.puts("AudioEngine ready (waiting for Start)")
+    end
+  end
+  wait.(wait, 300)
+end)'
+
 # Run Elixir with mix
-$elixirArgs = @("--eval", $evalCode, "-S", "mix", "run", "--no-halt")
+$elixirArgs = @("--eval", "`"$evalCode`"", "-S", "mix", "run", "--no-halt")
 & elixir $elixirArgs
