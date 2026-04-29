@@ -51,6 +51,14 @@ function Cleanup {
     } | Stop-Process -Force
 }
 
+Write-Host "Starting Elixir application..." -ForegroundColor Green
+Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
+Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
+
+# Run Elixir with mix
+$process = Start-Process elixir -ArgumentList "-S", "mix", "run", "--no-halt" -PassThru
+Write-Host "Elixir process started with PID: $($process.Id)" -ForegroundColor Green
+
 # Register cleanup handler
 $null = Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup }
 
