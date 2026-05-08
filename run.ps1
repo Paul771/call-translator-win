@@ -30,11 +30,6 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
     exit 1
 }
 
-# Start Flask web UI
-Write-Host "Starting Flask web UI..." -ForegroundColor Yellow
-$flaskProcess = Start-Process python -ArgumentList "web.py" -WindowStyle Hidden -PassThru
-Start-Sleep -Seconds 3
-
 # Cleanup function
 function Cleanup {
     Write-Host "Shutting down..." -ForegroundColor Yellow
@@ -48,16 +43,13 @@ function Cleanup {
         $_.Name -like "*audio_engine*" -or 
         $_.Name -like "*erl*" -or
         $_.Name -like "*beam*"
-    } | Stop-Process -Force
+    } | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Starting Elixir application..." -ForegroundColor Green
-Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
-Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
-
-# Run Elixir with mix
-$process = Start-Process elixir -ArgumentList "-S", "mix", "run", "--no-halt" -PassThru
-Write-Host "Elixir process started with PID: $($process.Id)" -ForegroundColor Green
+# Start Flask web UI
+Write-Host "Starting Flask web UI..." -ForegroundColor Yellow
+$flaskProcess = Start-Process python -ArgumentList "web.py" -WindowStyle Hidden -PassThru
+Start-Sleep -Seconds 3
 
 # Register cleanup handler
 $null = Register-ObjectEvent -InputObject $flaskProcess -EventName Exited -Action { Cleanup }
@@ -78,6 +70,10 @@ $evalCode = 'spawn(fn ->
   wait.(wait, 300)
 end)'
 
-# Run Elixir with mix
-$elixirArgs = @("--eval", "`"$evalCode`"", "-S", "mix", "run", "--no-halt")
-& elixir $elixirArgs
+# Run Elixir with mix (foreground, blocks until Ctrl+C)
+try {
+    $elixirArgs = @("--eval", "`"$evalCode`"", "-S", "mix", "run", "--no-halt")
+    & elixir $elixirArgs
+} finally {
+    Cleanup
+}

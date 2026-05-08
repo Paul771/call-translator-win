@@ -404,9 +404,20 @@ defp open_port do
   end
 
   defp dispatch_event(%{"event" => "device_list", "input" => input, "output" => output}, state) do
-    Logger.info("Received device list: #{length(input)} input, #{length(output)} output")
-    %{state | devices: %{"input" => input, "output" => output}}
+    # Filter out devices with invalid names
+    clean_input = Enum.filter(input, fn name -> is_valid_device_name(name) end)
+    clean_output = Enum.filter(output, fn name -> is_valid_device_name(name) end)
+    
+    Logger.info("Received device list: #{length(clean_input)} input, #{length(clean_output)} output")
+    %{state | devices: %{"input" => clean_input, "output" => clean_output}}
   end
+
+  defp is_valid_device_name(name) when is_binary(name) do
+    # Check if device name contains valid characters
+    name != "" and String.valid?(name) and String.length(name) > 0
+  end
+  
+  defp is_valid_device_name(_), do: false
 
   defp dispatch_event(
          %{"event" => "tts_audio", "direction" => _dir, "sample_rate" => sr, "audio_b64" => b64},
