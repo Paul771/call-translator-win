@@ -115,9 +115,12 @@ def list_audio_devices():
                 "powershell", "-Command",
                 "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name"
             ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            # Use subprocess with encoding to handle unicode properly
+            r = subprocess.run(cmd, capture_output=True, timeout=10)
+            # Decode output with utf-8, replacing errors
+            stdout = r.stdout.decode('utf-8', errors='replace')
             if r.returncode == 0:
-                devices = [line.strip() for line in r.stdout.split('\n') if line.strip()]
+                devices = [line.strip() for line in stdout.split('\n') if line.strip()]
                 return sorted(devices)
         else:
             # macOS/Linux fallback
