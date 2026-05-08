@@ -107,17 +107,31 @@ def scan_voices():
 
 def list_audio_devices():
     try:
-        r = subprocess.run(
-            ["system_profiler", "SPAudioDataType", "-json"],
-            capture_output=True, text=True, timeout=5,
-        )
-        data = json.loads(r.stdout)
-        devices = set()
-        for section in data.get("SPAudioDataType", []):
-            for item in section.get("_items", []):
-                name = item.get("_name", "")
-                if name:
-                    devices.add(name)
-        return sorted(devices)
+        # Windows-compatible way to get audio devices
+        import platform
+        if platform.system() == "Windows":
+            # Use PowerShell to get audio devices on Windows
+            cmd = [
+                "powershell", "-Command",
+                "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name"
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                devices = [line.strip() for line in r.stdout.split('\n') if line.strip()]
+                return sorted(devices)
+        else:
+            # macOS/Linux fallback
+            r = subprocess.run(
+                ["system_profiler", "SPAudioDataType", "-json"],
+                capture_output=True, text=True, timeout=5,
+            )
+            data = json.loads(r.stdout)
+            devices = set()
+            for section in data.get("SPAudioDataType", []):
+                for item in section.get("_items", []):
+                    name = item.get("_name", "")
+                    if name:
+                        devices.add(name)
+            return sorted(devices)
     except Exception:
         return []
