@@ -2,7 +2,7 @@ import Config
 
 config :translator,
   audio_engine_path:
-    Path.join([__DIR__, "..", "native", "audio_engine", "target", "release", "audio_engine"])
+    Path.join([__DIR__, "..", "native", "audio_engine", "target", "release", "audio_engine.exe"])
     |> Path.expand(),
   vad_threshold: 0.5,
   min_silence_ms: 500,

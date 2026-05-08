@@ -238,37 +238,21 @@ defmodule Translator.AudioEngine do
 
 defp open_port do
     engine_path = Application.get_env(:translator, :audio_engine_path)
-    # Проверяем сначала с расширением .exe для Windows
-    engine_path_exe = String.replace(engine_path, "audio_engine", "audio_engine.exe")
     settings = read_settings()
     models_base = System.get_env("TRANSLATOR_MODELS_DIR", "./models")
-
-    # Проверяем наличие файла сначала как есть, потом с .exe
-    engine_path_to_check = 
-      if File.exists?(engine_path) do
-        engine_path
-      else
-        if File.exists?(engine_path_exe) do
-          engine_path_exe
-        else
-          engine_path
-        end
-      end
 
     my_lang = Map.get(settings, "my_language", "ru")
     their_lang = Map.get(settings, "their_language", "en")
 
-    # Outgoing TTS = their language, Incoming TTS = my language
     out_voice = Map.get(settings, "tts_outgoing_voice", "")
     in_voice = Map.get(settings, "tts_incoming_voice", "")
 
-    # Default voices if not set
     out_voice = if out_voice == "", do: default_voice(models_base, their_lang), else: out_voice
     in_voice = if in_voice == "", do: default_voice(models_base, my_lang), else: in_voice
 
-    if engine_path_to_check && File.exists?(engine_path_to_check) do
+    if engine_path && File.exists?(engine_path) do
       port =
-        Port.open({:spawn_executable, engine_path_to_check}, [
+        Port.open({:spawn_executable, engine_path}, [
           :binary,
           {:packet, 4},
           :exit_status,
@@ -294,13 +278,12 @@ defp open_port do
       {:ok, port}
     else
       Logger.warning(
-        "AudioEngine binary not found at #{inspect(engine_path_to_check)}. " <>
+        "AudioEngine binary not found at #{inspect(engine_path)}. " <>
           "Run `mix compile` to build the Rust binary."
       )
 
-      {:error, :binary_not_found}
+{:error, :binary_not_found}
     end
-  end
   end
 
   defp read_settings do
