@@ -266,8 +266,8 @@ defp open_port do
             {~c"TRANSLATOR_TTS_RU_CONFIG", String.to_charlist("#{models_base}/piper-#{my_lang}/#{in_voice}.onnx.json")},
             {~c"TRANSLATOR_MIC_DEVICE", String.to_charlist(Map.get(settings, "mic_device", "default"))},
             {~c"TRANSLATOR_SPEAKER_DEVICE", String.to_charlist(Map.get(settings, "speaker_device", "default"))},
-            {~c"TRANSLATOR_MEET_INPUT", String.to_charlist(Map.get(settings, "meet_input_device", "BlackHole 16ch"))},
-            {~c"TRANSLATOR_MEET_OUTPUT", String.to_charlist(Map.get(settings, "meet_output_device", "BlackHole 2ch"))},
+            {~c"TRANSLATOR_MEET_INPUT", String.to_charlist(Map.get(settings, "meet_input_device", "CABLE Output (VB-Audio Virtual Cable)"))},
+            {~c"TRANSLATOR_MEET_OUTPUT", String.to_charlist(Map.get(settings, "meet_output_device", "CABLE Input (VB-Audio Virtual Cable)"))},
             {~c"TRANSLATOR_ENDPOINTING_MS", String.to_charlist("#{Map.get(settings, "endpointing_ms", 300)}")},
             {~c"TRANSLATOR_MY_LANG", String.to_charlist(Map.get(settings, "my_language", "ru"))},
             {~c"TRANSLATOR_THEIR_LANG", String.to_charlist(Map.get(settings, "their_language", "en"))}
