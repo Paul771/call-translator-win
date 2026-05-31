@@ -110,56 +110,75 @@ def list_audio_devices():
     try:
         import platform
         if platform.system() == "Windows":
-            # Use PowerShell with UTF-8 output encoding to get Windows audio devices.
-            # $OutputEncoding controls the encoding used when piping to external programs
-            # (i.e. how subprocess.run captures stdout). [Console]::OutputEncoding alone
-            # is not sufficient — we must set both.
-            cmd = [
-                "powershell", "-NoProfile", "-Command",
-                "$OutputEncoding = [Text.UTF8Encoding]::UTF8; " +
-                "[Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; " +
-                "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name"
-            ]
-            r = subprocess.run(cmd, capture_output=True, timeout=10)
-            # Try decoding with multiple encodings common on Russian Windows systems
-            raw = r.stdout
-            for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'cp866', 'cp1252'):
-                try:
-                    stdout = raw.decode(enc).strip()
-                    if stdout and any(
-                        'Ѐ' <= c <= 'ӿ'  # Cyrillic range check
-                        for c in stdout
-                    ):
-                        break
-                except (UnicodeDecodeError, LookupError):
-                    continue
-            else:
-                for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'cp866', 'cp1252'):
-                    try:
-                        stdout = raw.decode(enc).strip()
-                        break
-                    except (UnicodeDecodeError, LookupError):
-                        continue
-                else:
-                    stdout = raw.decode('utf-8', errors='replace').strip()
-            if r.returncode == 0:
-                devices = [line.strip() for line in stdout.split('\n') if line.strip()]
-                devices = [d for d in devices if d and not d.startswith('PS ')]
-                return sorted(devices)
+            return _list_audio_devices_windows()
         else:
-            r = subprocess.run(
-                ["system_profiler", "SPAudioDataType", "-json"],
-                capture_output=True, text=True, timeout=5,
-            )
-            data = json.loads(r.stdout)
-            devices = set()
-            for section in data.get("SPAudioDataType", []):
-                for item in section.get("_items", []):
-                    name = item.get("_name", "")
-                    if name:
-                        devices.add(name)
-            return sorted(devices)
+            return _list_audio_devices_macos()
     except Exception as e:
-        logger = logging.getLogger('translator')
-        logger.error(f"Failed to list audio devices: {e}")
-        return []
+        _logger = logging.getLogger('translator')
+        _logger.error(f"Failed to list audio devices: {e}")
+        return {"input": [], "output": []}
+
+
+def _list_audio_devices_windows():
+    """Enumerate audio devices via WASAPI using pycaw.
+
+    Returns separate lists for capture (microphones) and render (speakers/headphones).
+    This sees ALL device types including Bluetooth, USB-C, and virtual audio devices
+    that Win32_SoundDevice (WMI) misses.
+    """
+    try:
+        from pycaw.pycaw import AudioUtilities, EDataFlow, AudioDeviceState
+    except ImportError:
+        # Fallback if pycaw not installed — return empty lists
+        _logger = logging.getLogger('translator')
+        _logger.warning("pycaw not installed. Install with: pip install pycaw")
+        return {"input": [], "output": []}
+
+    input_devices = []
+    output_devices = []
+
+    try:
+        # eCapture = 1 (microphones), eRender = 0 (speakers/headphones)
+        for data_flow, label in [
+            (EDataFlow.eCapture.value, "input"),
+            (EDataFlow.eRender.value, "output"),
+        ]:
+            devices = AudioUtilities.GetAllDevices(
+                data_flow=data_flow,
+            )
+            result = []
+            for d in devices:
+                try:
+                    name = d.FriendlyName
+                    if name and d.state == AudioDeviceState.Active:
+                        result.append(name)
+                except Exception:
+                    continue
+
+            if label == "input":
+                input_devices = sorted(set(result))
+            else:
+                output_devices = sorted(set(result))
+
+    except Exception as e:
+        _logger = logging.getLogger('translator')
+        _logger.error(f"WASAPI enumeration failed: {e}")
+
+    return {"input": input_devices, "output": output_devices}
+
+
+def _list_audio_devices_macos():
+    """Enumerate audio devices on macOS via system_profiler."""
+    r = subprocess.run(
+        ["system_profiler", "SPAudioDataType", "-json"],
+        capture_output=True, text=True, timeout=5,
+    )
+    data = json.loads(r.stdout)
+    devices = set()
+    for section in data.get("SPAudioDataType", []):
+        for item in section.get("_items", []):
+            name = item.get("_name", "")
+            if name:
+                devices.add(name)
+    sorted_devices = sorted(devices)
+    return {"input": sorted_devices, "output": sorted_devices}
