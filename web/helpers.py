@@ -3,6 +3,7 @@
 import os
 import json
 import glob
+import logging
 import socket
 import subprocess
 import urllib.request
@@ -107,23 +108,45 @@ def scan_voices():
 
 def list_audio_devices():
     try:
-        # Windows-compatible way to get audio devices
         import platform
         if platform.system() == "Windows":
-            # Use PowerShell to get audio devices on Windows
+            # Use PowerShell with UTF-8 output encoding to get Windows audio devices.
+            # $OutputEncoding controls the encoding used when piping to external programs
+            # (i.e. how subprocess.run captures stdout). [Console]::OutputEncoding alone
+            # is not sufficient — we must set both.
             cmd = [
-                "powershell", "-Command",
+                "powershell", "-NoProfile", "-Command",
+                "$OutputEncoding = [Text.UTF8Encoding]::UTF8; " +
+                "[Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; " +
                 "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name"
             ]
-            # Use subprocess with encoding to handle unicode properly
             r = subprocess.run(cmd, capture_output=True, timeout=10)
-            # Decode output with utf-8, replacing errors
-            stdout = r.stdout.decode('utf-8', errors='replace')
+            # Try decoding with multiple encodings common on Russian Windows systems
+            raw = r.stdout
+            for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'cp866', 'cp1252'):
+                try:
+                    stdout = raw.decode(enc).strip()
+                    if stdout and any(
+                        'Ѐ' <= c <= 'ӿ'  # Cyrillic range check
+                        for c in stdout
+                    ):
+                        break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            else:
+                for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'cp866', 'cp1252'):
+                    try:
+                        stdout = raw.decode(enc).strip()
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                else:
+                    stdout = raw.decode('utf-8', errors='replace').strip()
             if r.returncode == 0:
                 devices = [line.strip() for line in stdout.split('\n') if line.strip()]
+                devices = [d for d in devices if d and not d.startswith('PS ')]
                 return sorted(devices)
         else:
-            # macOS/Linux fallback
             r = subprocess.run(
                 ["system_profiler", "SPAudioDataType", "-json"],
                 capture_output=True, text=True, timeout=5,
@@ -136,5 +159,7 @@ def list_audio_devices():
                     if name:
                         devices.add(name)
             return sorted(devices)
-    except Exception:
+    except Exception as e:
+        logger = logging.getLogger('translator')
+        logger.error(f"Failed to list audio devices: {e}")
         return []
