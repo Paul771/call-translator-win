@@ -323,6 +323,7 @@ defp open_port do
   defp close_port(%{port: nil} = state), do: state
   defp close_port(%{port: port} = state) do
     Logger.info("Closing audio_engine port")
+    log_to_file("[info] AudioEngine port closing")
     try do
       Port.close(port)
     rescue
@@ -429,7 +430,7 @@ defp open_port do
       "error" -> Logger.error("Engine: #{message}")
       _ -> Logger.info("Engine [#{level}]: #{message}")
     end
-
+    log_to_file("[#{level}] #{message}")
     state
   end
 
