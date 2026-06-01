@@ -138,10 +138,9 @@ def register_routes(app):
     @app.route("/api/devices")
     def api_devices():
         devices = list_audio_devices()
-        # list_audio_devices now returns {"input": [...], "output": [...]} directly
+        logger.info(f"/api/devices returned: input={len(devices.get('input', []))}, output={len(devices.get('output', []))}")
         if isinstance(devices, dict):
             return jsonify(devices)
-        # Fallback for old-style flat list
         return jsonify({"input": devices, "output": devices})
 
     @app.route("/api/tts-preview", methods=["POST"])

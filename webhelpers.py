@@ -126,28 +126,16 @@ def _list_audio_devices_windows():
     This sees ALL device types including Bluetooth, USB-C, and virtual audio devices
     that Win32_SoundDevice (WMI) misses.
     """
-    _logger = logging.getLogger('translator')
-
     try:
         from pycaw.pycaw import AudioUtilities, EDataFlow, AudioDeviceState
     except ImportError:
+        # Fallback if pycaw not installed — return empty lists
+        _logger = logging.getLogger('translator')
         _logger.warning("pycaw not installed. Install with: pip install pycaw")
         return {"input": [], "output": []}
 
     input_devices = []
     output_devices = []
-
-    try:
-        # Initialize COM for this thread (required by pycaw/WASAPI)
-        import ctypes as _ctypes
-        _ole32 = _ctypes.windll.ole32
-        _hr = _ole32.CoInitializeEx(None, 0)  # COINIT_APARTMENTTHREADED
-        if _hr < 0 and _hr != -2147417850:  # RPC_E_CHANGED_MODE is OK
-            _logger.warning(f"CoInitializeEx failed: hr={_hr:#x}")
-        else:
-            _logger.debug(f"CoInitializeEx OK: hr={_hr:#x}")
-    except Exception as _com_err:
-        _logger.warning(f"CoInitializeEx error: {_com_err}")
 
     try:
         # eCapture = 1 (microphones), eRender = 0 (speakers/headphones)
@@ -158,34 +146,23 @@ def _list_audio_devices_windows():
             devices = AudioUtilities.GetAllDevices(
                 data_flow=data_flow,
             )
-            _logger.info(f"WASAPI {label}: GetAllDevices returned {len(devices)} devices")
-
             result = []
-            for i, d in enumerate(devices):
+            for d in devices:
                 try:
                     name = d.FriendlyName
-                    state = d.state
-                    if name and state == AudioDeviceState.Active:
+                    if name and d.state == AudioDeviceState.Active:
                         result.append(name)
-                        _logger.debug(f"  [{i}] ACTIVE: {name}")
-                    elif name:
-                        _logger.debug(f"  [{i}] state={state}: {name}")
-                    else:
-                        _logger.debug(f"  [{i}] state={state}: <no name>")
-                except Exception as ex:
-                    _logger.debug(f"  [{i}] error: {ex}")
+                except Exception:
                     continue
 
-            _logger.info(f"WASAPI {label}: {len(result)} active devices with names")
-            sorted_result = sorted(set(result))
-
             if label == "input":
-                input_devices = sorted_result
+                input_devices = sorted(set(result))
             else:
-                output_devices = sorted_result
+                output_devices = sorted(set(result))
 
     except Exception as e:
-        _logger.error(f"WASAPI enumeration failed: {e}", exc_info=True)
+        _logger = logging.getLogger('translator')
+        _logger.error(f"WASAPI enumeration failed: {e}")
 
     return {"input": input_devices, "output": output_devices}
 
