@@ -69,43 +69,48 @@ defmodule Translator.AudioEngine do
 
   @impl true
   def init(_opts) do
+    # Don't start audio_engine here — it will be started on demand
+    # with fresh settings when start_pipelines is called.
+    Logger.info("AudioEngine GenServer started (engine not yet launched)")
+    {:ok, %__MODULE__{port: nil, status: :idle}}
+  end
+
+  @impl true
+  def handle_call({:start_pipelines, pipelines, config}, _from, state) do
+    Logger.info("Engine: start_pipelines called")
+
+    # Kill existing engine if running
+    state = close_port(state)
+
+    # Start fresh engine with current settings
     case open_port() do
       {:ok, port} ->
-        Logger.info("AudioEngine started, port opened")
-        {:ok, %__MODULE__{port: port, status: :idle}}
+        Logger.info("AudioEngine started with fresh settings, port opened")
+        command = %{
+          "cmd" => "start",
+          "pipelines" => pipelines,
+          "config" => encode_config(config)
+        }
+        json = Jason.encode!(command)
+        Logger.info("Engine: sending to port: #{json}")
+        send_to_port(port, command)
+        Logger.info("Engine: command sent to port, status=:starting")
+        {:reply, :ok, %{state | port: port, status: :starting, pipelines: pipelines}}
 
       {:error, reason} ->
         Logger.error("AudioEngine failed to open port: #{inspect(reason)}")
-        {:ok, %__MODULE__{port: nil, status: :crashed}}
+        {:reply, {:error, reason}, %{state | port: nil, status: :crashed}}
     end
   end
 
   @impl true
-  def handle_call({:start_pipelines, _pipelines, _config}, _from, %{port: nil} = state) do
-    Logger.error("Cannot start pipelines: engine port is not open")
-    {:reply, {:error, :port_not_open}, state}
-  end
-
-  def handle_call({:start_pipelines, pipelines, config}, _from, state) do
-    command = %{
-      "cmd" => "start",
-      "pipelines" => pipelines,
-      "config" => encode_config(config)
-    }
-
-    send_to_port(state.port, command)
-    {:reply, :ok, %{state | status: :starting, pipelines: pipelines}}
-  end
-
-  @impl true
-  def handle_call(:stop_pipelines, _from, %{port: nil} = state) do
-    {:reply, {:error, :port_not_open}, state}
-  end
-
   def handle_call(:stop_pipelines, _from, state) do
+    Logger.info("Engine: stop_pipelines called")
     command = %{"cmd" => "stop"}
     send_to_port(state.port, command)
-    {:reply, :ok, %{state | status: :stopping}}
+    # Close the port after stopping
+    state = close_port(state)
+    {:reply, :ok, %{state | status: :idle, pipelines: []}}
   end
 
   @impl true
@@ -194,13 +199,15 @@ defmodule Translator.AudioEngine do
 
   @impl true
   def handle_info({port, {:data, data}}, %{port: port} = state) do
+    Logger.debug("Engine: received #{byte_size(data)} bytes from port")
     case Jason.decode(data) do
       {:ok, event} ->
+        Logger.debug("Engine: decoded event: #{inspect(event)}")
         new_state = dispatch_event(event, state)
         {:noreply, new_state}
 
       {:error, reason} ->
-        Logger.warning("Failed to decode JSON from engine: #{inspect(reason)}")
+        Logger.warning("Failed to decode JSON from engine (#{byte_size(data)} bytes): #{inspect(reason)}")
         {:noreply, state}
     end
   end
@@ -239,10 +246,19 @@ defmodule Translator.AudioEngine do
 defp open_port do
     engine_path = Application.get_env(:translator, :audio_engine_path)
     settings = read_settings()
-    models_base = System.get_env("TRANSLATOR_MODELS_DIR", "./models")
+    # Use absolute path - project is at call-translator-win
+    base_dir = "C:/Users/Pavel/AppData/Roaming/npm/call-translator-win"
+    models_base = Path.join(base_dir, "models")
+    Logger.info("Using models base: #{models_base}")
 
     my_lang = Map.get(settings, "my_language", "ru")
     their_lang = Map.get(settings, "their_language", "en")
+
+    # Log API key status for debugging
+    dg_key = Map.get(settings, "deepgram_api_key", "")
+    groq_key = Map.get(settings, "groq_api_key", "")
+    Logger.info("Deepgram API key from settings: #{if dg_key != "", do: "present (len=#{String.length(dg_key)})", else: "MISSING"}")
+    Logger.info("Groq API key from settings: #{if groq_key != "", do: "present (len=#{String.length(groq_key)})", else: "MISSING"}")
 
     out_voice = Map.get(settings, "tts_outgoing_voice", "")
     in_voice = Map.get(settings, "tts_incoming_voice", "")
@@ -257,7 +273,8 @@ defp open_port do
           {:packet, 4},
           :exit_status,
           {:env, [
-            {~c"RUST_LOG", ~c"warn"},
+            {~c"RUST_LOG", ~c"info"},
+            {~c"ORT_DYLIB_PATH", ~c"C:/Users/Pavel/AppData/Roaming/npm/call-translator-win/onnxruntime.dll"},
             {~c"DEEPGRAM_API_KEY", charlist_setting(settings, "deepgram_api_key", "DEEPGRAM_API_KEY")},
             {~c"GROQ_API_KEY", charlist_setting(settings, "groq_api_key", "GROQ_API_KEY")},
             {~c"TRANSLATOR_TTS_EN_MODEL", String.to_charlist("#{models_base}/piper-#{their_lang}/#{out_voice}.onnx")},
@@ -287,7 +304,8 @@ defp open_port do
   end
 
   defp read_settings do
-    settings_path = Path.join(File.cwd!(), "settings.json")
+    base_dir = "C:/Users/Pavel/AppData/Roaming/npm/call-translator-win"
+    settings_path = Path.join(base_dir, "settings.json")
 
     case File.read(settings_path) do
       {:ok, contents} ->
@@ -297,8 +315,20 @@ defp open_port do
         end
 
       _ ->
+        Logger.warning("Settings file not found at #{settings_path}. Using empty config.")
         %{}
     end
+  end
+
+  defp close_port(%{port: nil} = state), do: state
+  defp close_port(%{port: port} = state) do
+    Logger.info("Closing audio_engine port")
+    try do
+      Port.close(port)
+    rescue
+      _ -> :ok
+    end
+    %{state | port: nil}
   end
 
   defp default_voice(models_base, lang) do
@@ -403,10 +433,10 @@ defp open_port do
     state
   end
 
-  defp dispatch_event(%{"event" => "device_list", "input" => input, "output" => output}, state) do
-    # Filter out devices with invalid names
-    clean_input = Enum.filter(input, fn name -> is_valid_device_name(name) end)
-    clean_output = Enum.filter(output, fn name -> is_valid_device_name(name) end)
+defp dispatch_event(%{"event" => "device_list", "input" => input, "output" => output}, state) do
+# Filter out devices with invalid names
+clean_input = Enum.filter(input, fn name -> is_valid_device_name(name) end)
+clean_output = Enum.filter(output, fn name -> is_valid_device_name(name) end)
     
     Logger.info("Received device list: #{length(clean_input)} input, #{length(clean_output)} output")
     %{state | devices: %{"input" => clean_input, "output" => clean_output}}
