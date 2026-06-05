@@ -297,6 +297,10 @@ impl Engine {
 
         info!("Spawning pipelines...");
 
+        // Shared echo suppression flag: set by incoming pipeline when TTS plays,
+        // checked by outgoing pipeline to avoid re-transcribing speaker output.
+        let echo_suppress = Arc::new(AtomicBool::new(false));
+
         for pipeline_name in pipelines {
             match pipeline_name.as_str() {
 "outgoing" => {
@@ -305,10 +309,16 @@ impl Engine {
                 self.config.my_language.clone(),
                 self.config.endpointing_ms,
             );
+            // Outgoing: captures from mic (Jabra), plays to CABLE Input (browser mic)
+            let playback_dev = if self.config.meet_output_device.is_empty() || self.config.meet_output_device == "default" {
+                self.config.speaker_device.clone()
+            } else {
+                self.config.meet_output_device.clone()
+            };
             let handle = spawn_pipeline(
                 "outgoing",
                 self.config.mic_device.clone(),
-                "default".to_string(),
+                playback_dev,
                 self.config.sample_rate,
                 stt,
                 translator.clone(),
@@ -319,32 +329,34 @@ impl Engine {
                 self.event_tx.clone(),
                 stop_flag.clone(),
                 self.mute_outgoing.clone(),
+                echo_suppress.clone(),
             )?;
             self.pipeline_handles.push(handle);
         }
         "incoming" => {
-            info!("[incoming] Pipeline disabled for diagnostics");
-            // let tts = tts_in.take(); // None if TTS disabled
-            //         let stt = DeepgramStt::new(
-            //             self.config.deepgram_api_key.clone(),
-            //             self.config.their_language.clone(),
-            //             self.config.endpointing_ms,
-            //         );
-            //         let handle = spawn_pipeline(
-            //             "incoming",
-            //             self.config.meet_input_device.clone(),
-            //             self.config.speaker_device.clone(),
-            //             self.config.sample_rate,
-            //             stt,
-            //             translator.clone(),
-            //             TranslationDirection::new(&self.config.their_language, &self.config.my_language),
-            //             &self.config.their_language,
-            //             tts,
-            //             self.event_tx.clone(),
-            //             stop_flag.clone(),
-            //             self.mute_incoming.clone(),
-            //         )?;
-            //         self.pipeline_handles.push(handle);
+            info!("[incoming] Pipeline enabled");
+            let stt = DeepgramStt::new(
+                self.config.deepgram_api_key.clone(),
+                self.config.their_language.clone(),
+                self.config.endpointing_ms,
+            );
+            let handle = spawn_pipeline(
+                "incoming",
+                self.config.meet_input_device.clone(),   // CABLE Output (browser speaker)
+                self.config.speaker_device.clone(),       // Jabra speakers (user hears)
+                self.config.sample_rate,
+                stt,
+                translator.clone(),
+                TranslationDirection::new(&self.config.their_language, &self.config.my_language),
+                &self.config.their_language,
+                &self.config.tts_ru_config,
+                &self.config.tts_ru_model,
+                self.event_tx.clone(),
+                stop_flag.clone(),
+                self.mute_incoming.clone(),
+                echo_suppress.clone(),
+            )?;
+            self.pipeline_handles.push(handle);
         }
                 other => warn!("Unknown pipeline: {}", other),
             }
@@ -388,6 +400,7 @@ fn spawn_pipeline(
     event_tx: Sender<Event>,
     stop_flag: Arc<AtomicBool>,
     mute_flag: Arc<AtomicBool>,
+    echo_suppress: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>> {
     let dir_name = direction.to_string();
     let src_lang = source_lang.to_string();
@@ -411,9 +424,10 @@ fn spawn_pipeline(
                 &event_tx,
                 &stop_flag,
                 &mute_flag,
+                echo_suppress,
             ) {
                 error!("{} pipeline failed: {:#}", dir_name, e);
-                let _ = event_tx.send(Event::Error {
+                let _ = event_tx.try_send(Event::Error {
                     message: format!("{} pipeline failed: {:#}", dir_name, e),
                 });
             }
@@ -443,6 +457,7 @@ fn run_pipeline(
     event_tx: &Sender<Event>,
     stop_flag: &AtomicBool,
     mute_flag: &AtomicBool,
+    echo_suppress: Arc<AtomicBool>,
 ) -> Result<()> {
     info!(
         "[{}] Starting pipeline: capture='{}', playback='{}'",
@@ -481,9 +496,6 @@ fn run_pipeline(
 
     info!("[{}] Pipeline running", direction);
 
-    // Echo suppression: ignore STT results while TTS is playing back through speakers.
-    let echo_suppress = Arc::new(AtomicBool::new(false));
-
     // Processor thread: translate + TTS, runs independently so audio loop is never blocked.
     let proc_translator = translator.clone();
     let proc_playback_tx = playback_tx.clone();
@@ -491,8 +503,8 @@ fn run_pipeline(
     let proc_direction = direction.to_string();
     let proc_source_lang = source_lang.to_string();
     let proc_sample_rate = sample_rate;
-    let proc_tts_config = tts_config.to_string();
-    let proc_tts_model = tts_model.to_string();
+    let _proc_tts_config = tts_config.to_string();
+    let _proc_tts_model = tts_model.to_string();
     // Pre-load TTS in background.
     // Use a channel so the processor thread can pick it up when ready
     // without blocking on the first utterance.
@@ -508,7 +520,7 @@ fn run_pipeline(
         .name(format!("{}-tts-preload", direction))
         .spawn(move || {
             tracelog::trace(&proc_direction_bg, "TTS", "background TTS preload started...");
-            let _ = proc_event_tx_bg.send(Event::TtsStatus {
+            let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
                 direction: proc_direction_bg.clone(),
                 status: "starting".into(),
                 message: "background TTS preload started".into(),
@@ -536,7 +548,7 @@ fn run_pipeline(
             match init_rx.recv_timeout(init_timeout) {
                 Ok(Ok(engine)) => {
                     tracelog::trace(&proc_direction_bg, "TTS", "background TTS preload OK ✓");
-                    let _ = proc_event_tx_bg.send(Event::TtsStatus {
+                    let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
                         direction: proc_direction_bg.clone(),
                         status: "ok".into(),
                         message: "TTS engine ready ✓".into(),
@@ -545,7 +557,7 @@ fn run_pipeline(
                 }
                 Ok(Err(e)) => {
                     tracelog::trace(&proc_direction_bg, "ERROR", &format!("TTS preload failed: {} — continuing without TTS", e));
-                    let _ = proc_event_tx_bg.send(Event::TtsStatus {
+                    let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
                         direction: proc_direction_bg.clone(),
                         status: "fail".into(),
                         message: format!("{}", e),
@@ -554,7 +566,7 @@ fn run_pipeline(
                 }
                 Err(_timeout) => {
                     tracelog::trace(&proc_direction_bg, "TTS", &format!("TTS preload timed out after {}s — disabling TTS", init_timeout.as_secs()));
-                    let _ = proc_event_tx_bg.send(Event::TtsStatus {
+                    let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
                         direction: proc_direction_bg.clone(),
                         status: "timeout".into(),
                         message: format!("init timed out after {}s — ONNX hang?", init_timeout.as_secs()),
@@ -566,6 +578,7 @@ fn run_pipeline(
 
     let mut tts: Option<TtsEngine> = None;
 
+    let _proc_echo = echo_suppress.clone();
     let _proc_handle = std::thread::spawn(move || {
         while let Ok((text, stt_ms)) = proc_rx.recv() {
             tracelog::trace(&proc_direction, "STT", &format!("PROCESSOR_RECEIVED stt={}ms text='{}'", stt_ms, text));
@@ -591,12 +604,27 @@ fn run_pipeline(
                 &proc_playback_tx,
                 &proc_event_tx,
             );
+
+            // Echo suppression: when incoming pipeline plays TTS to speakers,
+            // set shared flag so the outgoing pipeline ignores mic input.
+            // This prevents the speaker audio from being re-transcribed.
+            if _audio_len > 0 && proc_direction == "incoming" {
+                _proc_echo.store(true, Ordering::SeqCst);
+                let es = _proc_echo.clone();
+                let dur_ms = (_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 500;
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(dur_ms));
+                    es.store(false, Ordering::SeqCst);
+                });
+            }
         }
     });
 
     info!("[{}] Capture rate: {}Hz, STT rate: {}Hz", direction, capture_rate, stt_sample_rate);
 
     let mut need_reconnect = false;
+    let mut reconnect_attempts: u32 = 0;
+    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
     loop {
@@ -606,23 +634,40 @@ fn run_pipeline(
         }
 
         if need_reconnect {
-            info!("[{}] Reconnecting to Deepgram...", direction);
+            reconnect_attempts += 1;
+            if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+                error!("[{}] Max reconnection attempts ({}) exceeded", direction, MAX_RECONNECT_ATTEMPTS);
+                let _ = event_tx.try_send(Event::Error {
+                    message: format!("[{}] Deepgram reconnection failed after {} attempts", direction, MAX_RECONNECT_ATTEMPTS),
+                });
+                break;
+            }
+            let backoff_ms = std::cmp::min(2000u64 * 2u64.pow(reconnect_attempts.saturating_sub(1)), 30000);
+            info!("[{}] Reconnecting to Deepgram (attempt {}/{}, {}ms backoff)...", direction, reconnect_attempts, MAX_RECONNECT_ATTEMPTS, backoff_ms);
             session.close();
+            std::thread::sleep(Duration::from_millis(backoff_ms));
             match stt.create_session(stt_sample_rate) {
                 Ok(new_session) => {
                     session = new_session;
                     need_reconnect = false;
+                    reconnect_attempts = 0;
                     info!("[{}] Deepgram reconnected", direction);
                 }
                 Err(e) => {
                     error!("[{}] Deepgram reconnect failed: {:#}", direction, e);
-                    std::thread::sleep(std::time::Duration::from_secs(2));
                     continue;
                 }
             }
         }
 
-        // Send ALL available audio chunks to Deepgram (no loss)
+        // Flush any buffered audio before sending new data
+        if let Err(e) = session.flush_pending() {
+            warn!("[{}] Deepgram flush error: {:#}", direction, e);
+            need_reconnect = true;
+            continue;
+        }
+
+        // Send ALL available audio chunks to Deepgram (non-blocking, buffered on WouldBlock)
         let mut chunks_sent = 0usize;
         for chunk in audio_rx.try_iter().take(10) {
             if !mute_flag.load(Ordering::Relaxed) {
@@ -676,7 +721,7 @@ fn run_pipeline(
             Err(e) => {
                 error!("[{}] Deepgram error: {:#}", direction, e);
                 tracelog::trace(direction, "ERROR", &format!("Deepgram error: {}", e));
-                let _ = event_tx.send(Event::Error {
+                let _ = event_tx.try_send(Event::Error {
                     message: format!("[{}] Deepgram error: {:#}", direction, e),
                 });
                 need_reconnect = true;
@@ -713,7 +758,7 @@ fn process_utterance(
 ) -> usize {
     tracelog::trace(direction, "EVENT", &format!("→ Elixir: transcript '{}' (lang={})", text, source_lang));
 
-    let _ = event_tx.send(Event::Transcript {
+    let _ = event_tx.try_send(Event::Transcript {
         direction: direction.to_string(),
         text: text.to_string(),
         lang: source_lang.to_string(),
@@ -733,7 +778,7 @@ fn process_utterance(
             let ms = translate_start.elapsed().as_millis() as u64;
             error!("[{}] Translation error: {:#}", direction, e);
             tracelog::trace(direction, "ERROR", &format!("TRANSLATION_FAILED {}ms: {}", ms, e));
-            let _ = event_tx.send(Event::Error {
+            let _ = event_tx.try_send(Event::Error {
                 message: format!("[{}] Translation failed: {:#}", direction, e),
             });
             return 0;
@@ -742,7 +787,7 @@ fn process_utterance(
 
     let translate_ms = translate_start.elapsed().as_millis() as u64;
 
-    let _ = event_tx.send(Event::Translation {
+    let _ = event_tx.try_send(Event::Translation {
         direction: direction.to_string(),
         text: translated.clone(),
     });
@@ -767,7 +812,7 @@ fn process_utterance(
                 let ms = tts_start.elapsed().as_millis() as u64;
                 error!("[{}] TTS error: {:#}", direction, e);
                 tracelog::trace(direction, "ERROR", &format!("TTS_FAILED {}ms: {}", ms, e));
-                let _ = event_tx.send(Event::Error {
+                let _ = event_tx.try_send(Event::Error {
                     message: format!("[{}] TTS failed: {:#}", direction, e),
                 });
                 return 0;
@@ -794,7 +839,7 @@ fn process_utterance(
         }
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm_bytes);
-        let _ = event_tx.send(Event::TtsAudio {
+        let _ = event_tx.try_send(Event::TtsAudio {
             direction: direction.to_string(),
             sample_rate: monitor_rate,
             audio_b64: b64,
@@ -811,7 +856,7 @@ fn process_utterance(
         tracelog::trace(direction, "PLAYBACK", "no audio to play (TTS disabled or empty)");
     }
 
-    let _ = event_tx.send(Event::Metrics { stt_ms, translate_ms, tts_ms });
+    let _ = event_tx.try_send(Event::Metrics { stt_ms, translate_ms, tts_ms });
     tracelog::trace(direction, "METRICS", &format!("stt={}ms translate={}ms tts={}ms total={}ms",
         stt_ms, translate_ms, tts_ms, stt_ms + translate_ms + tts_ms));
 

@@ -8,6 +8,7 @@ mod tts;
 
 use std::io::{BufReader, BufWriter, Write};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
@@ -40,22 +41,42 @@ fn main() -> Result<()> {
     let (event_tx, event_rx) = bounded::<Event>(256);
 
     // Event writer thread: reads events from the channel, writes to stdout.
-    // This is the only thread that writes to stdout, avoiding lock contention.
+    // Uses recv_timeout to avoid blocking indefinitely on a full pipe.
+    // If flush fails (pipe full), we keep the writer but drop events to
+    // prevent cascading backpressure into pipeline threads.
     let writer_handle = thread::Builder::new()
         .name("event-writer".into())
         .spawn(move || {
             let stdout = std::io::stdout().lock();
             let mut writer = BufWriter::new(stdout);
+            let flush_interval = Duration::from_millis(100);
+            let mut last_flush = std::time::Instant::now();
 
-            while let Ok(event) = event_rx.recv() {
-                debug!("Sending event: {:?}", event);
-                if let Err(e) = write_event(&mut writer, &event) {
-                    error!("Failed to write event: {:#}", e);
-                    break;
+            loop {
+                match event_rx.recv_timeout(flush_interval) {
+                    Ok(event) => {
+                        debug!("Sending event: {:?}", event);
+                        if let Err(e) = write_event(&mut writer, &event) {
+                            error!("Failed to write event: {:#}", e);
+                            continue;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // Timeout is normal — periodic flush keeps pipe clear
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        debug!("Event channel closed, writer exiting");
+                        break;
+                    }
                 }
-                if let Err(e) = writer.flush() {
-                    error!("Failed to flush stdout: {:#}", e);
-                    break;
+                // Flush periodically (not on every event to reduce syscalls)
+                if last_flush.elapsed() >= flush_interval {
+                    if let Err(e) = writer.flush() {
+                        error!("Failed to flush stdout: {:#}", e);
+                        // Don't break — keep trying. Reset writer to clear buffered data.
+                        let _ = std::mem::replace(&mut writer, BufWriter::new(std::io::stdout().lock()));
+                    }
+                    last_flush = std::time::Instant::now();
                 }
             }
             debug!("Event writer thread exiting");

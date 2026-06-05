@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use log::{debug, info, warn};
+use log::info;
 use serde::Deserialize;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
@@ -113,7 +113,8 @@ impl DeepgramStt {
         log_file(&format!("WS connected status={}", resp.status()));
         tracelog::trace("stt", "STT", &format!("WS connected status={}", resp.status()));
 
-        // Set TCP stream to non-blocking for the underlying socket
+        // Socket stays non-blocking at all times.
+        // On WouldBlock we buffer audio and flush on next iteration.
         set_nonblocking(&mut ws)?;
 
         info!("Deepgram session connected");
@@ -121,14 +122,18 @@ impl DeepgramStt {
             ws,
             last_send_time: Instant::now(),
             sample_rate,
+            pending_audio: Vec::new(),
         })
     }
 }
+
+const MAX_PENDING_AUDIO: usize = 65536; // 64KB cap for non-blocking send buffer
 
 pub struct DeepgramSession {
     ws: WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     last_send_time: Instant,
     sample_rate: u32,
+    pending_audio: Vec<u8>,
 }
 
 pub struct SttResult {
@@ -148,17 +153,31 @@ impl DeepgramSession {
 
         let byte_len = bytes.len();
 
-        // Send in blocking mode: temporarily set the socket to blocking,
-        // send, then restore non-blocking. This ensures audio is never
-        // silently dropped when the OS buffer is full.
-        set_blocking(&mut self.ws)?;
-        let send_result = self.ws.send(Message::Binary(bytes));
-        set_nonblocking(&mut self.ws)?;
-
-        match send_result {
+        // Always non-blocking. If the TCP send buffer is full (WouldBlock),
+        // buffer the audio and flush on the next pipeline iteration.
+        // This prevents the pipeline from blocking on backpressure.
+        match self.ws.send(Message::Binary(bytes)) {
             Ok(()) => {
                 self.last_send_time = Instant::now();
                 tracelog::trace("stt", "STT", &format!("audio sent: {} bytes", byte_len));
+                Ok(())
+            }
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock => {
+                tracelog::trace("stt", "STT", &format!("send WouldBlock — buffering {} bytes", byte_len));
+                // bytes was consumed by ws.send, re-encode for buffer
+                let rebuf: Vec<u8> = samples
+                    .iter()
+                    .flat_map(|&s| {
+                        let i = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        i.to_le_bytes()
+                    })
+                    .collect();
+                self.pending_audio.extend_from_slice(&rebuf);
+                if self.pending_audio.len() > MAX_PENDING_AUDIO {
+                    let excess = self.pending_audio.len() - MAX_PENDING_AUDIO;
+                    self.pending_audio.drain(..excess);
+                    tracelog::trace("stt", "STT", &format!("pending buffer capped, dropped {} oldest bytes", excess));
+                }
                 Ok(())
             }
             Err(e) => {
@@ -166,6 +185,32 @@ impl DeepgramSession {
                 Err(anyhow::anyhow!("Failed to send audio to Deepgram: {}", e))
             }
         }
+    }
+
+    pub fn flush_pending(&mut self) -> Result<()> {
+        if self.pending_audio.is_empty() {
+            return Ok(());
+        }
+        match self.ws.send(Message::Binary(self.pending_audio.clone())) {
+            Ok(()) => {
+                tracelog::trace("stt", "STT", &format!("flushed {} buffered bytes", self.pending_audio.len()));
+                self.pending_audio.clear();
+                self.last_send_time = Instant::now();
+                Ok(())
+            }
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock => {
+                tracelog::trace("stt", "STT", &format!("flush WouldBlock — {} still buffered", self.pending_audio.len()));
+                Ok(())
+            }
+            Err(e) => {
+                tracelog::trace("stt", "ERROR", &format!("WS flush failed: {}", e));
+                Err(anyhow::anyhow!("Failed to flush pending audio: {}", e))
+            }
+        }
+    }
+
+    pub fn reset_pending(&mut self) {
+        self.pending_audio.clear();
     }
 
     pub fn poll_transcript(&mut self) -> Result<Option<SttResult>> {
@@ -225,6 +270,7 @@ impl DeepgramSession {
     }
 
     pub fn close(&mut self) {
+        self.pending_audio.clear();
         let _ = self.ws.send(Message::Binary(vec![]));
         let _ = self.ws.close(None);
     }
@@ -262,6 +308,7 @@ fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> R
     Ok(())
 }
 
+#[allow(dead_code)]
 fn set_blocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> Result<()> {
     match ws.get_mut() {
         MaybeTlsStream::Plain(s) => {
