@@ -58,22 +58,10 @@ Write-Host "Starting Elixir application..." -ForegroundColor Green
 Write-Host "Open http://127.0.0.1:5050 in your browser" -ForegroundColor Green
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 
-# Define the evaluation code for Elixir
-$evalCode = 'spawn(fn ->
-  wait = fn wait, n ->
-    case Process.whereis(Translator.AudioEngine) do
-      nil when n > 0 -> Process.sleep(100); wait.(wait, n - 1)
-      nil -> IO.puts("AudioEngine not started after 30s")
-      _pid -> IO.puts("AudioEngine ready (waiting for Start)")
-    end
-  end
-  wait.(wait, 300)
-end)'
-
 # Run Elixir with mix (foreground, blocks until Ctrl+C)
 try {
-    $elixirArgs = @("--eval", "`"$evalCode`"", "-S", "mix", "run", "--no-halt")
-    & elixir $elixirArgs
+    Write-Host "Running: mix run --no-halt" -ForegroundColor Yellow
+    & mix run --no-halt
 } finally {
     Cleanup
 }

@@ -12,17 +12,21 @@ defmodule Translator.CommandServer do
 
   @impl true
   def init(_opts) do
-    {:ok, listen} =
-      :gen_tcp.listen(@port, [
-        :binary,
-        packet: :line,
-        active: false,
-        reuseaddr: true
-      ])
-
+    listen = try_listen(10)
     Logger.info("CommandServer listening on port #{@port}")
     spawn_link(fn -> accept_loop(listen) end)
     {:ok, %{listen: listen}}
+  end
+
+  defp try_listen(0), do: raise("Failed to listen on port #{@port} after retries")
+  defp try_listen(n) do
+    case :gen_tcp.listen(@port, [:binary, packet: :line, active: false, reuseaddr: true]) do
+      {:ok, listen} -> listen
+      {:error, :eaddrinuse} ->
+        Logger.warning("Port #{@port} in use, retrying (#{n-1} left)...")
+        :timer.sleep(2000)
+        try_listen(n - 1)
+    end
   end
 
   defp accept_loop(listen) do

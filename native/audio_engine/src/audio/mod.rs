@@ -12,67 +12,55 @@ pub fn list_devices() -> Result<(Vec<String>, Vec<String>)> {
 
     let mut input_names = Vec::new();
     let mut output_names = Vec::new();
+    let mut lines = Vec::new();
 
     if let Some(dev) = host.default_input_device() {
         let name = dev.name().unwrap_or_else(|_| "unknown".into());
-        // Filter out devices with invalid UTF-8 sequences or control characters
-        if name.chars().all(|c| !c.is_control() || c.is_whitespace()) {
-            info!("Default input device: {}", name);
-        } else {
-            info!("Default input device: {}", name);
-        }
+        lines.push(format!("Default INPUT device: {}", name));
+    } else {
+        lines.push("No default input device".into());
     }
 
     if let Some(dev) = host.default_output_device() {
         let name = dev.name().unwrap_or_else(|_| "unknown".into());
-        // Filter out devices with invalid UTF-8 sequences or control characters
-        if name.chars().all(|c| !c.is_control() || c.is_whitespace()) {
-            info!("Default output device: {}", name);
-        } else {
-            info!("Default output device: {}", name);
-        }
+        lines.push(format!("Default OUTPUT device: {}", name));
+    } else {
+        lines.push("No default output device".into());
     }
 
     let inputs = host
         .input_devices()
         .context("Failed to enumerate input devices")?;
 
-    info!("Available input devices:");
+    lines.push("Available INPUT devices:".into());
     for device in inputs {
         let name = device.name().unwrap_or_else(|_| "unknown".into());
-        // Filter out devices with invalid UTF-8 sequences or control characters
-        if name.chars().all(|c| !c.is_control() || c.is_whitespace()) {
-            info!("  - {}", name);
-            input_names.push(name);
-        } else {
-            let clean_name = name
-                .chars()
-                .filter(|c| !c.is_control() || c.is_whitespace())
-                .collect::<String>();
-            info!("  - {} (cleaned)", clean_name);
-            input_names.push(clean_name);
-        }
+        lines.push(format!("  '{}'", name));
+        input_names.push(name);
     }
 
     let outputs = host
         .output_devices()
         .context("Failed to enumerate output devices")?;
 
-    info!("Available output devices:");
+    lines.push("Available OUTPUT devices:".into());
     for device in outputs {
         let name = device.name().unwrap_or_else(|_| "unknown".into());
-        // Filter out devices with invalid UTF-8 sequences or control characters
-        if name.chars().all(|c| !c.is_control() || c.is_whitespace()) {
-            info!("  - {}", name);
-            output_names.push(name);
-        } else {
-            let clean_name = name
-                .chars()
-                .filter(|c| !c.is_control() || c.is_whitespace())
-                .collect::<String>();
-            info!("  - {} (cleaned)", clean_name);
-            output_names.push(clean_name);
-        }
+        lines.push(format!("  '{}'", name));
+        output_names.push(name);
+    }
+
+    let msg = lines.join("\n");
+    // Print to stderr and log file
+    eprintln!("{}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open("deepgram_debug.log")
+    {
+        use std::io::Write;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] AUDIO DEVICES:\n{}", secs, msg);
     }
 
     Ok((input_names, output_names))

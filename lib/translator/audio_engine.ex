@@ -469,6 +469,16 @@ clean_output = Enum.filter(output, fn name -> is_valid_device_name(name) end)
     state
   end
 
+  defp dispatch_event(%{"event" => "tts_status", "direction" => dir, "status" => status, "message" => msg}, state) do
+    case status do
+      "ok" -> Logger.info("[TTS] [#{dir}] preloaded: #{msg}")
+      "fail" -> Logger.warning("[TTS] [#{dir}] failed: #{msg}")
+      "timeout" -> Logger.warning("[TTS] [#{dir}] timeout: #{msg}")
+      _ -> Logger.info("[TTS] [#{dir}] #{status}: #{msg}")
+    end
+    state
+  end
+
   defp dispatch_event(event, state) do
     Logger.debug("Unhandled engine event: #{inspect(event)}")
     state

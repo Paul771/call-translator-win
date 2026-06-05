@@ -3,6 +3,14 @@ name = "audio_engine"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "test_onnx_session"
+path = "src/bin/test_onnx_session.rs"
+
+[[bin]]
+name = "test_tts"
+path = "src/bin/test_tts.rs"
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -15,6 +23,8 @@ ringbuf = "0.4.8"
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
 ndarray = "0.17.2"
 rubato = "0.15.0"
-ureq = { version = "2.12.1", features = ["json"] }
+reqwest = { version = "0.12.15", features = ["native-tls", "json", "blocking"] }
 tungstenite = { version = "0.21.0", features = ["native-tls"] }
 base64 = "0.22.1"
+wasapi = "0.23.0"
+windows = { version = "0.62", features = ["Win32_Media_Multimedia", "Win32_Foundation", "Win32_System_Com"] }

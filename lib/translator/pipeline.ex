@@ -43,7 +43,7 @@ defmodule Translator.Pipeline do
   end
 
   @impl true
-  def handle_cast({:event, %{"type" => "transcript", "text" => text} = event}, state) do
+  def handle_cast({:event, %{"event" => "transcript", "text" => text} = event}, state) do
     timestamp = Map.get(event, "timestamp", System.system_time(:millisecond))
 
     entry = %{text: text, timestamp: timestamp}
@@ -56,7 +56,7 @@ defmodule Translator.Pipeline do
     {:noreply, %{state | transcripts: [entry | state.transcripts]}}
   end
 
-  def handle_cast({:event, %{"type" => "translation", "text" => text} = event}, state) do
+  def handle_cast({:event, %{"event" => "translation", "text" => text} = event}, state) do
     timestamp = Map.get(event, "timestamp", System.system_time(:millisecond))
 
     entry = %{text: text, timestamp: timestamp}

@@ -63,6 +63,11 @@ pub enum Event {
         output: Vec<String>,
     },
     TtsPreviewDone,
+    TtsStatus {
+        direction: String,
+        status: String,
+        message: String,
+    },
     TtsAudio {
         direction: String,
         sample_rate: u32,

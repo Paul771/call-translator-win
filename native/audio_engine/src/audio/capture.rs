@@ -1,27 +1,36 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
 use crossbeam_channel::Sender;
 use log::{debug, error, info};
+use std::time::Duration;
 
 pub struct AudioChunk {
     pub samples: Vec<f32>,
 }
 
-/// Captures audio from a named device and sends chunks to a channel.
+fn log_file_cap(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open("deepgram_debug.log")
+    {
+        use std::io::Write;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] {}", secs, msg);
+    }
+}
+
+pub static CAPTURE_CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub struct AudioCapture {
-    stream: Stream,
+    stream: Option<Stream>,
     device_name: String,
     sample_rate: u32,
 }
 
 impl AudioCapture {
-    /// Create capture from a specific device name.
-    ///
-    /// Uses the device's default configuration (sample rate + channels) to guarantee
-    /// compatibility across different devices (built-in mic, headphones, etc.).
-    /// Audio is downmixed to mono before sending.
-    // ... existing code ...
     pub fn new(device_name: &str, sender: Sender<AudioChunk>) -> Result<Self> {
         let device = find_input_device(device_name)?;
         let actual_name = device.name().unwrap_or_else(|_| "unknown".into());
@@ -33,10 +42,17 @@ impl AudioCapture {
         let channels = default_cfg.channels();
         let sample_rate = default_cfg.sample_rate().0;
 
+        let cfg_msg = format!(
+            "Device '{}' default config: rate={}Hz, channels={}, sample_format={:?}",
+            actual_name, sample_rate, channels, default_cfg.sample_format()
+        );
+        info!("{}", cfg_msg);
+        log_file_cap(&cfg_msg);
+
         let config = StreamConfig {
             channels,
             sample_rate: default_cfg.sample_rate(),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: cpal::BufferSize::Fixed(320),
         };
 
         info!(
@@ -44,20 +60,33 @@ impl AudioCapture {
             actual_name, sample_rate, channels
         );
 
-        // On Windows, we use the provided config. Some devices might require 
-        // specific sample rates or buffer sizes.
         let stream = device
             .build_input_stream(
                 &config,
                 move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                    // Downmix to mono by averaging channels if needed.
+                    let prev = CAPTURE_CHUNK_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let first = data.first().copied().unwrap_or(0.0);
+                    let rms_raw = (data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32).sqrt();
+                    if prev == 0 || prev % 50 == 0 || rms_raw > 0.001 {
+                        let msg = format!("Capture chunk #{} ({} samples, first={:.4}, rms_raw={:.6})", prev + 1, data.len(), first, rms_raw);
+                        info!("{}", msg);
+                        log_file_cap(&msg);
+                    }
+                    // Dynamic gain normalization: scale audio to use full dynamic range
+                    let rms = (data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32).sqrt();
+                    let target_rms = 0.25; // Target RMS for speech (25% of full scale)
+                    let adaptive_gain = if rms > 0.00001 { (target_rms / rms).min(100.0).max(1.0) } else { 50.0 };
+                    let effective_gain = adaptive_gain;
                     let mono: Vec<f32> = if channels == 1 {
-                        data.to_vec()
+                        data.iter().map(|&s| (s * effective_gain).clamp(-1.0, 1.0)).collect()
                     } else {
                         data.chunks(channels as usize)
-                            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                            .map(|frame| (frame.iter().sum::<f32>() / channels as f32 * effective_gain).clamp(-1.0, 1.0))
                             .collect()
                     };
+                    if prev % 200 == 0 || rms > 0.001 {
+                        info!("[{}] gain={:.1}, rms={:.6}, adaptive_gain={:.1}, first_sample={:.4}", prev+1, effective_gain, rms, adaptive_gain, data.first().copied().unwrap_or(0.0));
+                    }
                     let chunk = AudioChunk { samples: mono };
                     if let Err(e) = sender.try_send(chunk) {
                         debug!("Capture channel full or disconnected: {}", e);
@@ -68,29 +97,30 @@ impl AudioCapture {
             )
             .context("Failed to build input stream")?;
 
-        Ok(Self { stream, device_name: actual_name, sample_rate })
+        Ok(Self { stream: Some(stream), device_name: actual_name, sample_rate })
     }
-    // ... existing code ...
 
     pub fn start(&self) -> Result<()> {
-        self.stream.play().context("Failed to start capture stream")?;
+        if let Some(ref stream) = self.stream {
+            stream.play().context("Failed to start capture stream")?;
+        }
         info!("Capture started on '{}'", self.device_name);
         Ok(())
     }
 
     pub fn stop(&self) -> Result<()> {
-        self.stream.pause().context("Failed to pause capture stream")?;
+        if let Some(ref stream) = self.stream {
+            stream.pause().context("Failed to pause capture stream")?;
+        }
         info!("Capture stopped on '{}'", self.device_name);
         Ok(())
     }
 
-    /// Actual sample rate the device is running at.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 }
 
-/// Find an input device by name. `"default"` returns the default input device.
 fn find_input_device(name: &str) -> Result<Device> {
     let host = cpal::default_host();
 
