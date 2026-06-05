@@ -3,6 +3,7 @@
 import os
 import json
 import glob
+import logging
 import socket
 import subprocess
 import urllib.request
@@ -107,34 +108,100 @@ def scan_voices():
 
 def list_audio_devices():
     try:
-        # Windows-compatible way to get audio devices
         import platform
         if platform.system() == "Windows":
-            # Use PowerShell to get audio devices on Windows
-            cmd = [
-                "powershell", "-Command",
-                "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name"
-            ]
-            # Use subprocess with encoding to handle unicode properly
-            r = subprocess.run(cmd, capture_output=True, timeout=10)
-            # Decode output with utf-8, replacing errors
-            stdout = r.stdout.decode('utf-8', errors='replace')
-            if r.returncode == 0:
-                devices = [line.strip() for line in stdout.split('\n') if line.strip()]
-                return sorted(devices)
+            return _list_audio_devices_windows()
         else:
-            # macOS/Linux fallback
-            r = subprocess.run(
-                ["system_profiler", "SPAudioDataType", "-json"],
-                capture_output=True, text=True, timeout=5,
+            return _list_audio_devices_macos()
+    except Exception as e:
+        _logger = logging.getLogger('translator')
+        _logger.error(f"Failed to list audio devices: {e}")
+        return {"input": [], "output": []}
+
+
+def _list_audio_devices_windows():
+    """Enumerate audio devices via WASAPI using pycaw.
+
+    Returns separate lists for capture (microphones) and render (speakers/headphones).
+    This sees ALL device types including Bluetooth, USB-C, and virtual audio devices
+    that Win32_SoundDevice (WMI) misses.
+    """
+    _logger = logging.getLogger('translator')
+
+    try:
+        from pycaw.pycaw import AudioUtilities, EDataFlow, AudioDeviceState
+    except ImportError:
+        _logger.warning("pycaw not installed. Install with: pip install pycaw")
+        return {"input": [], "output": []}
+
+    input_devices = []
+    output_devices = []
+
+    try:
+        # Initialize COM for this thread (required by pycaw/WASAPI)
+        import ctypes as _ctypes
+        _ole32 = _ctypes.windll.ole32
+        _hr = _ole32.CoInitializeEx(None, 0)  # COINIT_APARTMENTTHREADED
+        if _hr < 0 and _hr != -2147417850:  # RPC_E_CHANGED_MODE is OK
+            _logger.warning(f"CoInitializeEx failed: hr={_hr:#x}")
+        else:
+            _logger.debug(f"CoInitializeEx OK: hr={_hr:#x}")
+    except Exception as _com_err:
+        _logger.warning(f"CoInitializeEx error: {_com_err}")
+
+    try:
+        # eCapture = 1 (microphones), eRender = 0 (speakers/headphones)
+        for data_flow, label in [
+            (EDataFlow.eCapture.value, "input"),
+            (EDataFlow.eRender.value, "output"),
+        ]:
+            devices = AudioUtilities.GetAllDevices(
+                data_flow=data_flow,
             )
-            data = json.loads(r.stdout)
-            devices = set()
-            for section in data.get("SPAudioDataType", []):
-                for item in section.get("_items", []):
-                    name = item.get("_name", "")
-                    if name:
-                        devices.add(name)
-            return sorted(devices)
-    except Exception:
-        return []
+            _logger.info(f"WASAPI {label}: GetAllDevices returned {len(devices)} devices")
+
+            result = []
+            for i, d in enumerate(devices):
+                try:
+                    name = d.FriendlyName
+                    state = d.state
+                    if name and state == AudioDeviceState.Active:
+                        result.append(name)
+                        _logger.debug(f"  [{i}] ACTIVE: {name}")
+                    elif name:
+                        _logger.debug(f"  [{i}] state={state}: {name}")
+                    else:
+                        _logger.debug(f"  [{i}] state={state}: <no name>")
+                except Exception as ex:
+                    _logger.debug(f"  [{i}] error: {ex}")
+                    continue
+
+            _logger.info(f"WASAPI {label}: {len(result)} active devices with names")
+            sorted_result = sorted(set(result))
+
+            if label == "input":
+                input_devices = sorted_result
+            else:
+                output_devices = sorted_result
+
+    except Exception as e:
+        _logger.error(f"WASAPI enumeration failed: {e}", exc_info=True)
+
+    return {"input": input_devices, "output": output_devices}
+
+
+def _list_audio_devices_macos():
+    """Enumerate audio devices on macOS via system_profiler."""
+    r = subprocess.run(
+        ["system_profiler", "SPAudioDataType", "-json"],
+        capture_output=True, text=True, timeout=5,
+    )
+    data = json.loads(r.stdout)
+    devices = set()
+    for section in data.get("SPAudioDataType", []):
+        for item in section.get("_items", []):
+            name = item.get("_name", "")
+            if name:
+                devices.add(name)
+    sorted_devices = sorted(devices)
+    return {"input": sorted_devices, "output": sorted_devices}

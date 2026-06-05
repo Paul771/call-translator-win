@@ -2,6 +2,7 @@ mod audio;
 mod engine;
 mod protocol;
 mod stt;
+mod tracelog;
 mod translation;
 mod tts;
 
@@ -23,14 +24,17 @@ fn main() -> Result<()> {
 
     info!("audio_engine starting");
 
-    // Initialize ONNX Runtime (required for load-dynamic feature).
-    // Must be called before any ort::Session creation (TTS Piper).
-    let ort_dylib = std::env::var("ORT_DYLIB_PATH")
-        .unwrap_or_else(|_| "/usr/local/lib/onnxruntime.dll".into());
-    ort::init_from(&ort_dylib)
-        .expect("Failed to load ONNX Runtime dylib")
-        .commit();
-    info!("ONNX Runtime loaded from {}", ort_dylib);
+    // Initialize pipeline trace logger (clears old log, prunes >24h logs)
+    tracelog::init_log();
+    tracelog::prune_old_logs();
+    tracelog::trace("engine", "INIT", "audio_engine started, trace logging active");
+
+    // ONNX Runtime init is deferred to the TTS preload thread (engine.rs)
+    // to avoid COM conflicts with WASAPI audio capture.
+    // ort::init().commit() is called inside the TTS init worker.
+    info!("ONNX Runtime init deferred to TTS preload thread");
+    
+    // Channel for events from pipeline threads -> stdout writer
 
     // Channel for events from pipeline threads -> stdout writer
     let (event_tx, event_rx) = bounded::<Event>(256);
