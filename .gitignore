@@ -1,8 +1,27 @@
-﻿onnxruntime_x64/
+﻿# Build artifacts
+native/audio_engine/target/
+_build/
+deps/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary artifacts
+onnxruntime_x64/
 onnxruntime_x64.zip
 onnxruntime-1.24.2/
-*.log
-cline-resume.txt
+onnxruntime.dll.old
 native/audio_engine/devices.txt
 native/audio_engine/bak*.exe
-native/audio_engine/target/
+
+# Elixir
+call-translator-win-git/
