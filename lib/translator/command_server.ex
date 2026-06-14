@@ -23,9 +23,39 @@ defmodule Translator.CommandServer do
     case :gen_tcp.listen(@port, [:binary, packet: :line, active: false, reuseaddr: true]) do
       {:ok, listen} -> listen
       {:error, :eaddrinuse} ->
-        Logger.warning("Port #{@port} in use, retrying (#{n-1} left)...")
-        :timer.sleep(2000)
+        Logger.warning("Port #{@port} in use, attempting cleanup (#{n-1} left)...")
+        kill_port_owner(@port)
+        :timer.sleep(1000)
         try_listen(n - 1)
+    end
+  end
+
+  defp kill_port_owner(port) do
+    try do
+      case System.cmd("netstat", ["-ano"], stderr_to_stdout: true) do
+        {output, 0} ->
+          output
+          |> String.split("\n")
+          |> Enum.find(fn line -> String.contains?(line, ":#{port}") && String.contains?(line, "LISTENING") end)
+          |> case do
+            nil -> :ok
+            line ->
+              line |> String.split() |> List.last() |> String.trim() |> case do
+                "" -> :ok
+                pid_str ->
+                  case Integer.parse(pid_str) do
+                    {pid, _} ->
+                      Logger.warning("Killing orphaned process PID=#{pid} on port #{port}")
+                      System.cmd("taskkill", ["/F", "/PID", "#{pid}"], stderr_to_stdout: true)
+                      :timer.sleep(500)
+                    _ -> :ok
+                  end
+              end
+          end
+        _ -> :ok
+      end
+    rescue
+      _ -> :ok
     end
   end
 

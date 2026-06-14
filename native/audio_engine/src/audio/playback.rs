@@ -29,6 +29,8 @@ impl AudioPlayback {
             .name()
             .unwrap_or_else(|_| "unknown".into());
 
+        eprintln!("[PLAYBACK] Using device: '{}' (requested: '{}')", actual_name, device_name);
+
         // Windows WASAPI often requires specific sample rates.
         // We try to find the closest supported config to the requested sample_rate.
         let mut supported = device
@@ -66,9 +68,7 @@ impl AudioPlayback {
                 loop {
                     match receiver.recv() {
                         Ok(samples) => {
-                            for &_sample in &samples {
-                                let _ = producer.push_slice(&samples);
-                            }
+                            let _ = producer.push_slice(&samples);
                         }
                         Err(_) => {
                             debug!("Playback feeder: channel disconnected, stopping");
