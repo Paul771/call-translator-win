@@ -49,6 +49,29 @@
           </div>
           <div class="sp-hint">Used for translation via LLM. Get a key at console.groq.com</div>
         </div>
+        <div class="sp-field">
+          <div class="sp-label">Yandex API Key <span class="badge">Translation</span></div>
+          <div class="sp-input-row">
+            <input class="sp-input sp-key" id="cfg-yandex" type="text" placeholder="Enter Yandex API key..." autocomplete="one-time-code" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other">
+          </div>
+          <div class="sp-hint">Alternative translation provider. Works from Russia. Get a key at console.cloud.yandex.ru</div>
+        </div>
+        <div class="sp-field">
+          <div class="sp-label">Yandex Folder ID</div>
+          <div class="sp-input-row">
+            <input class="sp-input" id="cfg-yandex-folder" type="text" placeholder="Enter Yandex Folder ID..." autocomplete="one-time-code" spellcheck="false">
+          </div>
+          <div class="sp-hint">Required for Yandex Translate API. Found in Yandex Cloud console.</div>
+        </div>
+        <div class="sp-field">
+          <div class="sp-label">Translation Provider</div>
+          <select class="sp-input" id="cfg-translation-provider">
+            <option value="auto">Auto (try Groq, fallback to Yandex)</option>
+            <option value="groq">Groq only</option>
+            <option value="yandex">Yandex only</option>
+          </select>
+          <div class="sp-hint">Auto tries Groq first, falls back to Yandex if Groq fails.</div>
+        </div>
       </div>
     </div>
 

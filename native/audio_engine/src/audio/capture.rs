@@ -4,7 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
 use crossbeam_channel::Sender;
 use log::{debug, error, info};
-use std::time::Duration;
+
 
 pub struct AudioChunk {
     pub samples: Vec<f32>,

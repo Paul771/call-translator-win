@@ -3,6 +3,10 @@ name = "audio_engine"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+directml = []
+
 [[bin]]
 name = "test_onnx_session"
 path = "src/bin/test_onnx_session.rs"

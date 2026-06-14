@@ -1,10 +1,8 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use log::debug;
 use ort::session::Session;
 use ort::value::Value;

@@ -29,6 +29,9 @@ use crate::tts::TtsEngine;
 pub struct EngineConfig {
     pub deepgram_api_key: String,
     pub groq_api_key: String,
+    pub yandex_api_key: String,
+    pub yandex_folder_id: String,
+    pub translation_provider: String,
     pub tts_en_model: String,
     pub tts_en_config: String,
     pub tts_ru_model: String,
@@ -49,15 +52,34 @@ impl EngineConfig {
         // Read API keys from environment variables (set by Elixir from settings.json)
         let dg_key = std::env::var("DEEPGRAM_API_KEY").unwrap_or_default();
         let groq_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+        let yandex_key = std::env::var("YANDEX_API_KEY").unwrap_or_default();
+        let yandex_folder_id = std::env::var("YANDEX_FOLDER_ID").unwrap_or_default();
+        let translation_provider = std::env::var("TRANSLATOR_PROVIDER").unwrap_or_else(|_| "auto".into());
         
         eprintln!("[ENGINE] DEEPGRAM_API_KEY from env: {}... (len={})", 
             if dg_key.len() >= 4 { &dg_key[..4] } else { "?" }, dg_key.len());
         eprintln!("[ENGINE] GROQ_API_KEY from env: {}... (len={})", 
             if groq_key.len() >= 4 { &groq_key[..4] } else { "?" }, groq_key.len());
+        eprintln!("[ENGINE] YANDEX_API_KEY from env: {}... (len={})", 
+            if yandex_key.len() >= 4 { &yandex_key[..4] } else { "?" }, yandex_key.len());
+        eprintln!("[ENGINE] TRANSLATOR_PROVIDER='{}'", translation_provider);
+
+        // Log device env vars for debugging
+        let mic = std::env::var("TRANSLATOR_MIC_DEVICE").unwrap_or_default();
+        let speaker = std::env::var("TRANSLATOR_SPEAKER_DEVICE").unwrap_or_default();
+        let meet_in = std::env::var("TRANSLATOR_MEET_INPUT").unwrap_or_default();
+        let meet_out = std::env::var("TRANSLATOR_MEET_OUTPUT").unwrap_or_default();
+        eprintln!("[ENGINE] TRANSLATOR_MIC_DEVICE='{}'", mic);
+        eprintln!("[ENGINE] TRANSLATOR_SPEAKER_DEVICE='{}'", speaker);
+        eprintln!("[ENGINE] TRANSLATOR_MEET_INPUT='{}'", meet_in);
+        eprintln!("[ENGINE] TRANSLATOR_MEET_OUTPUT='{}'", meet_out);
 
         Self {
             deepgram_api_key: dg_key,
             groq_api_key: groq_key,
+            yandex_api_key: yandex_key,
+            yandex_folder_id: yandex_folder_id,
+            translation_provider: translation_provider,
             tts_en_model: std::env::var("TRANSLATOR_TTS_EN_MODEL")
                 .unwrap_or_else(|_| format!("{}/piper-en/en_GB-alan-low.onnx", base)),
             tts_en_config: std::env::var("TRANSLATOR_TTS_EN_CONFIG")
@@ -288,7 +310,7 @@ impl Engine {
 
         info!("Loading translation models...");
         let translator = Arc::new(
-            TranslationEngine::new(&self.config.groq_api_key)
+            TranslationEngine::new(&self.config.groq_api_key, &self.config.yandex_api_key, &self.config.yandex_folder_id, &self.config.translation_provider)
             .context("Failed to initialize translation engine")?,
         );
 
@@ -297,9 +319,13 @@ impl Engine {
 
         info!("Spawning pipelines...");
 
-        // Shared echo suppression flag: set by incoming pipeline when TTS plays,
-        // checked by outgoing pipeline to avoid re-transcribing speaker output.
-        let echo_suppress = Arc::new(AtomicBool::new(false));
+        // Two-directional echo suppression:
+        // - outgoing_suppress: set by INCOMING when its TTS plays to Jabra speakers,
+        //   checked by OUTGOING to ignore Jabra mic picking up speaker audio.
+        // - incoming_suppress: set by OUTGOING when its TTS plays to CABLE Input,
+        //   checked by INCOMING to ignore CABLE Output picking up the TTS loop.
+        let outgoing_suppress = Arc::new(AtomicBool::new(false));
+        let incoming_suppress = Arc::new(AtomicBool::new(false));
 
         for pipeline_name in pipelines {
             match pipeline_name.as_str() {
@@ -311,8 +337,11 @@ impl Engine {
             );
             // Outgoing: captures from mic (Jabra), plays to CABLE Input (browser mic)
             let playback_dev = if self.config.meet_output_device.is_empty() || self.config.meet_output_device == "default" {
+                tracelog::trace("engine", "DEVICE", &format!("Outgoing playback: FALLBACK to speaker_device='{}' (meet_output='{}' empty/default)", 
+                    self.config.speaker_device, self.config.meet_output_device));
                 self.config.speaker_device.clone()
             } else {
+                tracelog::trace("engine", "DEVICE", &format!("Outgoing playback: using meet_output_device='{}'", self.config.meet_output_device));
                 self.config.meet_output_device.clone()
             };
             let handle = spawn_pipeline(
@@ -329,12 +358,15 @@ impl Engine {
                 self.event_tx.clone(),
                 stop_flag.clone(),
                 self.mute_outgoing.clone(),
-                echo_suppress.clone(),
+                outgoing_suppress.clone(),   // checked by outgoing
+                incoming_suppress.clone(),   // set by outgoing (suppresses incoming)
             )?;
             self.pipeline_handles.push(handle);
         }
         "incoming" => {
             info!("[incoming] Pipeline enabled");
+            tracelog::trace("engine", "DEVICE", &format!("Incoming pipeline: capture='{}' (meet_input), playback='{}' (speaker)", 
+                self.config.meet_input_device, self.config.speaker_device));
             let stt = DeepgramStt::new(
                 self.config.deepgram_api_key.clone(),
                 self.config.their_language.clone(),
@@ -354,7 +386,8 @@ impl Engine {
                 self.event_tx.clone(),
                 stop_flag.clone(),
                 self.mute_incoming.clone(),
-                echo_suppress.clone(),
+                incoming_suppress.clone(),   // checked by incoming
+                outgoing_suppress.clone(),   // set by incoming (suppresses outgoing)
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -400,7 +433,8 @@ fn spawn_pipeline(
     event_tx: Sender<Event>,
     stop_flag: Arc<AtomicBool>,
     mute_flag: Arc<AtomicBool>,
-    echo_suppress: Arc<AtomicBool>,
+    my_suppress: Arc<AtomicBool>,   // checked by this pipeline (set by other)
+    set_other_suppress: Arc<AtomicBool>,  // set by this pipeline (checked by other)
 ) -> Result<thread::JoinHandle<()>> {
     let dir_name = direction.to_string();
     let src_lang = source_lang.to_string();
@@ -410,6 +444,7 @@ fn spawn_pipeline(
     let handle = thread::Builder::new()
         .name(format!("pipeline-{}", direction))
         .spawn(move || {
+            let proc_set_other = set_other_suppress.clone(); // clone for processor thread
             if let Err(e) = run_pipeline(
                 &dir_name,
                 &capture_device,
@@ -424,7 +459,8 @@ fn spawn_pipeline(
                 &event_tx,
                 &stop_flag,
                 &mute_flag,
-                echo_suppress,
+                my_suppress,
+                proc_set_other,
             ) {
                 error!("{} pipeline failed: {:#}", dir_name, e);
                 let _ = event_tx.try_send(Event::Error {
@@ -457,7 +493,8 @@ fn run_pipeline(
     event_tx: &Sender<Event>,
     stop_flag: &AtomicBool,
     mute_flag: &AtomicBool,
-    echo_suppress: Arc<AtomicBool>,
+    my_suppress: Arc<AtomicBool>,       // checked by this pipeline (set by other)
+    set_other_suppress: Arc<AtomicBool>, // set by this pipeline (checked by other)
 ) -> Result<()> {
     info!(
         "[{}] Starting pipeline: capture='{}', playback='{}'",
@@ -578,7 +615,7 @@ fn run_pipeline(
 
     let mut tts: Option<TtsEngine> = None;
 
-    let _proc_echo = echo_suppress.clone();
+    let _proc_echo = set_other_suppress.clone();
     let _proc_handle = std::thread::spawn(move || {
         while let Ok((text, stt_ms)) = proc_rx.recv() {
             tracelog::trace(&proc_direction, "STT", &format!("PROCESSOR_RECEIVED stt={}ms text='{}'", stt_ms, text));
@@ -605,10 +642,11 @@ fn run_pipeline(
                 &proc_event_tx,
             );
 
-            // Echo suppression: when incoming pipeline plays TTS to speakers,
-            // set shared flag so the outgoing pipeline ignores mic input.
-            // This prevents the speaker audio from being re-transcribed.
-            if _audio_len > 0 && proc_direction == "incoming" {
+            // Echo suppression: set the OTHER pipeline's suppress flag when we play TTS.
+            // Each pipeline checks its OWN suppress flag before forwarding transcripts:
+            //   outgoing checks outgoing_suppress (set by incoming TTS → Jabra speakers)
+            //   incoming checks incoming_suppress (set by outgoing TTS → CABLE Input)
+            if _audio_len > 0 {
                 _proc_echo.store(true, Ordering::SeqCst);
                 let es = _proc_echo.clone();
                 let dur_ms = (_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 500;
@@ -624,7 +662,7 @@ fn run_pipeline(
 
     let mut need_reconnect = false;
     let mut reconnect_attempts: u32 = 0;
-    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+    const MAX_BACKOFF_MS: u64 = 30000;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
     loop {
@@ -635,15 +673,11 @@ fn run_pipeline(
 
         if need_reconnect {
             reconnect_attempts += 1;
-            if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
-                error!("[{}] Max reconnection attempts ({}) exceeded", direction, MAX_RECONNECT_ATTEMPTS);
-                let _ = event_tx.try_send(Event::Error {
-                    message: format!("[{}] Deepgram reconnection failed after {} attempts", direction, MAX_RECONNECT_ATTEMPTS),
-                });
-                break;
-            }
-            let backoff_ms = std::cmp::min(2000u64 * 2u64.pow(reconnect_attempts.saturating_sub(1)), 30000);
-            info!("[{}] Reconnecting to Deepgram (attempt {}/{}, {}ms backoff)...", direction, reconnect_attempts, MAX_RECONNECT_ATTEMPTS, backoff_ms);
+            let backoff_ms = std::cmp::min(
+                2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
+                MAX_BACKOFF_MS,
+            );
+            info!("[{}] Reconnecting to Deepgram (attempt #{}, {}ms backoff, keep retrying)...", direction, reconnect_attempts, backoff_ms);
             session.close();
             std::thread::sleep(Duration::from_millis(backoff_ms));
             match stt.create_session(stt_sample_rate) {
@@ -705,7 +739,7 @@ fn run_pipeline(
         match session.poll_transcript() {
             Ok(Some(result)) => {
                 tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
-                if echo_suppress.load(Ordering::SeqCst) {
+                if my_suppress.load(Ordering::SeqCst) {
                     info!("[{}] Echo suppressed: '{}'", direction, result.text);
                     tracelog::trace(direction, "STT", "ECHO_SUPPRESSED — not forwarded to processor");
                 } else {

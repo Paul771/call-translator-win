@@ -499,16 +499,22 @@ function toggleSection(id) {
 function populateForm(s) {
   const dg = document.getElementById('cfg-deepgram');
   const gr = document.getElementById('cfg-groq');
+  const yk = document.getElementById('cfg-yandex');
+  const yf = document.getElementById('cfg-yandex-folder');
   if (dg._setRealValue) dg._setRealValue(s.deepgram_api_key || '');
   else dg.value = s.deepgram_api_key || '';
   if (gr._setRealValue) gr._setRealValue(s.groq_api_key || '');
   else gr.value = s.groq_api_key || '';
+  if (yk._setRealValue) yk._setRealValue(s.yandex_api_key || '');
+  else yk.value = s.yandex_api_key || '';
+  yf.value = s.yandex_folder_id || '';
   if (!s.deepgram_api_key && s._deepgram_from_env) dg.placeholder = 'Set via .env file';
   if (!s.groq_api_key && s._groq_from_env) gr.placeholder = 'Set via .env file';
   document.getElementById('cfg-my-lang').value = s.my_language || 'en';
   document.getElementById('cfg-their-lang').value = s.their_language || 'en';
   document.getElementById('cfg-endpointing').value = s.endpointing_ms || 300;
   document.getElementById('endpointing-val').textContent = (s.endpointing_ms || 300) + 'ms';
+  document.getElementById('cfg-translation-provider').value = s.translation_provider || 'auto';
   // Device dropdowns populated by loadDevices() using currentSettings
 }
 
@@ -516,6 +522,9 @@ function readForm() {
   return {
     deepgram_api_key: (document.getElementById('cfg-deepgram')._getRealValue || (() => document.getElementById('cfg-deepgram').value))().trim(),
     groq_api_key: (document.getElementById('cfg-groq')._getRealValue || (() => document.getElementById('cfg-groq').value))().trim(),
+    yandex_api_key: (document.getElementById('cfg-yandex')._getRealValue || (() => document.getElementById('cfg-yandex').value))().trim(),
+    yandex_folder_id: document.getElementById('cfg-yandex-folder').value.trim(),
+    translation_provider: document.getElementById('cfg-translation-provider').value,
     my_language: document.getElementById('cfg-my-lang').value,
     their_language: document.getElementById('cfg-their-lang').value,
     tts_outgoing_voice: document.getElementById('cfg-voice-out').value,

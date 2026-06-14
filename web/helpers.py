@@ -33,6 +33,40 @@ def call_groq(messages, api_key, temperature=0.1, max_tokens=None, timeout=10):
     return result["choices"][0]["message"]["content"].strip()
 
 
+def call_yandex(text, source_lang, target_lang, api_key, folder_id, timeout=10):
+    """Translate text via Yandex Translate API."""
+    body = json.dumps({
+        "sourceLanguageCode": source_lang,
+        "targetLanguageCode": target_lang,
+        "texts": [text],
+        "folderId": folder_id,
+    }).encode()
+    req = urllib.request.Request(
+        "https://translate.api.cloud.yandex.net/translate/v2/translate",
+        data=body,
+        headers={
+            "Authorization": f"Api-Key {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        result = json.loads(resp.read().decode())
+    return result["translations"][0]["text"]
+
+
+def get_yandex_key():
+    from .settings import load_settings
+    settings = load_settings()
+    return settings.get("yandex_api_key", "") or os.environ.get("YANDEX_API_KEY", "")
+
+
+def get_yandex_folder_id():
+    from .settings import load_settings
+    settings = load_settings()
+    return settings.get("yandex_folder_id", "") or os.environ.get("YANDEX_FOLDER_ID", "")
+
+
 def send_engine_command(cmd, timeout=10):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

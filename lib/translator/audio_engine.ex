@@ -277,6 +277,8 @@ defp open_port do
             {~c"ORT_DYLIB_PATH", ~c"C:/Users/Pavel/AppData/Roaming/npm/call-translator-win/onnxruntime.dll"},
             {~c"DEEPGRAM_API_KEY", charlist_setting(settings, "deepgram_api_key", "DEEPGRAM_API_KEY")},
             {~c"GROQ_API_KEY", charlist_setting(settings, "groq_api_key", "GROQ_API_KEY")},
+            {~c"YANDEX_API_KEY", charlist_setting(settings, "yandex_api_key", "YANDEX_API_KEY")},
+            {~c"YANDEX_FOLDER_ID", charlist_setting(settings, "yandex_folder_id", "YANDEX_FOLDER_ID")},
             {~c"TRANSLATOR_TTS_EN_MODEL", String.to_charlist("#{models_base}/piper-#{their_lang}/#{out_voice}.onnx")},
             {~c"TRANSLATOR_TTS_EN_CONFIG", String.to_charlist("#{models_base}/piper-#{their_lang}/#{out_voice}.onnx.json")},
             {~c"TRANSLATOR_TTS_RU_MODEL", String.to_charlist("#{models_base}/piper-#{my_lang}/#{in_voice}.onnx")},
@@ -287,7 +289,8 @@ defp open_port do
             {~c"TRANSLATOR_MEET_OUTPUT", String.to_charlist(Map.get(settings, "meet_output_device", "CABLE Input (VB-Audio Virtual Cable)"))},
             {~c"TRANSLATOR_ENDPOINTING_MS", String.to_charlist("#{Map.get(settings, "endpointing_ms", 300)}")},
             {~c"TRANSLATOR_MY_LANG", String.to_charlist(Map.get(settings, "my_language", "ru"))},
-            {~c"TRANSLATOR_THEIR_LANG", String.to_charlist(Map.get(settings, "their_language", "en"))}
+            {~c"TRANSLATOR_THEIR_LANG", String.to_charlist(Map.get(settings, "their_language", "en"))},
+            {~c"TRANSLATOR_PROVIDER", String.to_charlist(Map.get(settings, "translation_provider", "auto"))}
           ]}
         ])
 
@@ -311,7 +314,15 @@ defp open_port do
       {:ok, contents} ->
         case Jason.decode(contents) do
           {:ok, settings} -> settings
-          _ -> %{}
+          _ ->
+            Logger.warning("JSON decode failed, trying to fix encoding")
+            utf8 = :unicode.characters_to_binary(contents, :latin1, :utf8)
+            case Jason.decode(utf8) do
+              {:ok, settings} ->
+                File.write(settings_path, utf8)
+                settings
+              _ -> %{}
+            end
         end
 
       _ ->
@@ -435,29 +446,18 @@ defp open_port do
   end
 
 defp dispatch_event(%{"event" => "device_list", "input" => input, "output" => output}, state) do
-# Filter out devices with invalid names
 clean_input = Enum.filter(input, fn name -> is_valid_device_name(name) end)
 clean_output = Enum.filter(output, fn name -> is_valid_device_name(name) end)
-    
     Logger.info("Received device list: #{length(clean_input)} input, #{length(clean_output)} output")
     %{state | devices: %{"input" => clean_input, "output" => clean_output}}
   end
-
-  defp is_valid_device_name(name) when is_binary(name) do
-    # Check if device name contains valid characters
-    name != "" and String.valid?(name) and String.length(name) > 0
-  end
-  
-  defp is_valid_device_name(_), do: false
 
   defp dispatch_event(
          %{"event" => "tts_audio", "direction" => _dir, "sample_rate" => sr, "audio_b64" => b64},
          state
        ) do
-    # Store in process dict for polling by web UI (not in log — too large for SSE)
     queue = Process.get(:audio_queue, [])
     Process.put(:audio_queue, queue ++ [%{"sr" => sr, "b64" => b64}])
-    # Keep max 5
     if length(queue) > 5 do
       Process.put(:audio_queue, Enum.take(queue, -5))
     end
@@ -483,6 +483,12 @@ clean_output = Enum.filter(output, fn name -> is_valid_device_name(name) end)
     Logger.debug("Unhandled engine event: #{inspect(event)}")
     state
   end
+
+  defp is_valid_device_name(name) when is_binary(name) do
+    name != "" and String.valid?(name) and String.length(name) > 0
+  end
+
+  defp is_valid_device_name(_), do: false
 
   defp notify_pipeline(direction, event) do
     case find_pipeline_pid(direction) do

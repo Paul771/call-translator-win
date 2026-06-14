@@ -1,7 +1,7 @@
 use wasapi::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    initialize_mta();
+    let _ = initialize_mta();
     
     let enumerator = DeviceEnumerator::new()?;
     let collection = enumerator.get_device_collection(&Direction::Capture)?;

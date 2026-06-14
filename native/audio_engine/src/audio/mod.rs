@@ -3,7 +3,7 @@ pub mod playback;
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
-use log::info;
+
 
 /// List all available audio devices (useful for debugging).
 /// Returns (input_names, output_names).

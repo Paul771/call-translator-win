@@ -53,6 +53,9 @@ DEFAULT_VOICES = {
 DEFAULT_SETTINGS = {
     "deepgram_api_key": "",
     "groq_api_key": "",
+    "yandex_api_key": "",
+    "yandex_folder_id": "",
+    "translation_provider": "auto",
     "tts_outgoing_voice": "",
     "tts_incoming_voice": "",
     "mic_device": "default",

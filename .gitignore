@@ -1,4 +1,4 @@
-﻿# Build artifacts
+# Build artifacts
 native/audio_engine/target/
 _build/
 deps/
@@ -25,3 +25,26 @@ native/audio_engine/bak*.exe
 
 # Elixir
 call-translator-win-git/
+
+# Sensitive files
+.env
+settings.json
+calls.db
+test-log.txt
+groq_debug.log
+deepgram_debug.log
+pipeline_trace.log
+
+# Test files
+test_*.py
+test_*.ps1
+test_*.exs
+check_*.ps1
+check_*.py
+debug_*.py
+find_*.ps1
+kill.ps1
+watch_log.ps1
+list_audio.ps1
+cline-resume.txt
+flask_test.py

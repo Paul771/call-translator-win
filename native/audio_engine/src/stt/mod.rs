@@ -132,6 +132,7 @@ const MAX_PENDING_AUDIO: usize = 65536; // 64KB cap for non-blocking send buffer
 pub struct DeepgramSession {
     ws: WebSocket<MaybeTlsStream<std::net::TcpStream>>,
     last_send_time: Instant,
+    #[allow(dead_code)]
     sample_rate: u32,
     pending_audio: Vec<u8>,
 }
@@ -209,6 +210,7 @@ impl DeepgramSession {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reset_pending(&mut self) {
         self.pending_audio.clear();
     }
@@ -219,13 +221,21 @@ impl DeepgramSession {
                 Ok(Message::Text(text)) => {
                     // Detailed response logging is now handled by tracelog in the transcript branch below.
                     // Hex debug logging to deepgram_debug.log removed to save disk space.
+                    // Deepgram sends `channel` as `[0,1]` (array) in SpeechStarted/UtteranceEnd events
+                    // and as `{"alternatives": [...]}` in transcription results.
+                    // Use serde_json::Value to handle both formats.
                     match serde_json::from_str::<DgResponse>(&text) {
                         Ok(resp) => {
                             let transcript = resp
                                 .channel
-                                .and_then(|c| c.alternatives.into_iter().next())
-                                .map(|a| a.transcript)
-                                .unwrap_or_default();
+                                .as_ref()
+                                .and_then(|c| c.get("alternatives"))
+                                .and_then(|alt| alt.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|a| a.get("transcript"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or_default()
+                                .to_string();
                             let is_final = resp.is_final == Some(true);
                             if is_final && !transcript.trim().is_empty() {
                                 let since_last = self.last_send_time.elapsed().as_millis() as u64;
@@ -278,18 +288,10 @@ impl DeepgramSession {
 
 #[derive(Deserialize)]
 struct DgResponse {
+    #[serde(default)]
     is_final: Option<bool>,
-    channel: Option<DgChannel>,
-}
-
-#[derive(Deserialize)]
-struct DgChannel {
-    alternatives: Vec<DgAlternative>,
-}
-
-#[derive(Deserialize)]
-struct DgAlternative {
-    transcript: String,
+    #[serde(default)]
+    channel: Option<serde_json::Value>,
 }
 
 fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> Result<()> {

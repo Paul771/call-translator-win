@@ -9,6 +9,7 @@ use ringbuf::{
 };
 
 /// Plays audio received from a channel to a named output device.
+#[allow(dead_code)]
 pub struct AudioPlayback {
     stream: Stream,
     device_name: String,
@@ -65,7 +66,7 @@ impl AudioPlayback {
                 loop {
                     match receiver.recv() {
                         Ok(samples) => {
-                            for &sample in &samples {
+                            for &_sample in &samples {
                                 let _ = producer.push_slice(&samples);
                             }
                         }

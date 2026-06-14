@@ -1,3 +1,129 @@
+# Yandex Translate Integration Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use compose:subagent (recommended) or compose:execute to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add Yandex Translate API as an alternative translation provider, with automatic fallback from Groq to Yandex when Groq is unavailable (e.g., blocked from Russia).
+
+**Architecture:** Modify the Rust `TranslationEngine` to support multiple providers. Add Yandex Translate REST API as a second backend. The engine tries Groq first; if it returns 403 or fails, it falls back to Yandex. Add `YANDEX_API_KEY` environment variable and settings support.
+
+**Tech Stack:** Rust (reqwest), Elixir (env vars), Flask (settings UI)
+
+---
+
+## File Structure
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `native/audio_engine/src/translation/mod.rs` | Modify | Add Yandex provider, fallback logic |
+| `native/audio_engine/src/translation/yandex.rs` | Create | Yandex Translate API client |
+| `lib/translator/audio_engine.ex` | Modify | Pass YANDEX_API_KEY env var |
+| `web/settings.py` | Modify | Add yandex_api_key to defaults |
+| `web/routes.py` | Modify | Test Yandex key endpoint |
+| `settings.json` | Modify | Add yandex_api_key field |
+| `.env` | Modify | Add YANDEX_API_KEY placeholder |
+
+---
+
+## Task 1: Create Yandex Translate API Client
+
+**Files:**
+- Create: `native/audio_engine/src/translation/yandex.rs`
+
+- [ ] **Step 1: Create the yandex.rs module**
+
+```rust
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+pub struct YandexTranslator {
+    api_key: String,
+    folder_id: String,
+    client: reqwest::blocking::Client,
+}
+
+#[derive(Deserialize)]
+struct YandexResponse {
+    translations: Vec<YandexTranslation>,
+}
+
+#[derive(Deserialize)]
+struct YandexTranslation {
+    text: String,
+}
+
+impl YandexTranslator {
+    pub fn new(api_key: &str, folder_id: &str) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .context("Failed to build HTTP client for Yandex")?;
+        Ok(Self {
+            api_key: api_key.to_string(),
+            folder_id: folder_id.to_string(),
+            client,
+        })
+    }
+
+    pub fn translate(&self, text: &str, source_lang: &str, target_lang: &str) -> Result<String> {
+        if text.trim().is_empty() {
+            return Ok(String::new());
+        }
+
+        let body = serde_json::json!({
+            "sourceLanguageCode": source_lang,
+            "targetLanguageCode": target_lang,
+            "texts": [text],
+            "folderId": self.folder_id,
+        });
+
+        let response = self.client
+            .post("https://translate.api.cloud.yandex.net/translate/v2/translate")
+            .header("Authorization", format!("Api-Key {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&body).unwrap_or_default())
+            .send()
+            .context("Yandex Translate request failed")?;
+
+        let status = response.status();
+        let bytes = response.bytes().context("Failed to read Yandex response")?;
+        let response_text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
+
+        if !status.is_success() {
+            anyhow::bail!("Yandex Translate error {}: {}", status, response_text);
+        }
+
+        let yandex_resp: YandexResponse = serde_json::from_str(&response_text)
+            .context("Failed to parse Yandex response")?;
+
+        let translated = yandex_resp.translations
+            .into_iter()
+            .next()
+            .map(|t| t.text)
+            .unwrap_or_default();
+
+        Ok(translated)
+    }
+}
+```
+
+- [ ] **Step 2: Verify it compiles**
+
+Run: `cd native/audio_engine && cargo check --lib 2>&1 | head -20`
+Expected: No errors (warnings OK)
+
+---
+
+## Task 2: Integrate Yandex into TranslationEngine
+
+**Files:**
+- Modify: `native/audio_engine/src/translation/mod.rs`
+
+- [ ] **Step 1: Add yandex module and update TranslationEngine**
+
+Replace the entire `translation/mod.rs` with:
+
+```rust
 pub mod yandex;
 
 use anyhow::{bail, Context, Result};
@@ -47,35 +173,36 @@ fn lang_name(code: &str) -> &str {
     }
 }
 
+pub enum TranslationProvider {
+    Groq,
+    Yandex,
+}
+
 #[derive(Clone)]
 pub struct TranslationEngine {
     groq_key: String,
     yandex_key: String,
     yandex_folder_id: String,
-    provider: String,
     client: reqwest::blocking::Client,
 }
 
 impl TranslationEngine {
-    pub fn new(groq_key: &str, yandex_key: &str, yandex_folder_id: &str, provider: &str) -> Result<Self> {
-        eprintln!("[TRANSLATION] Provider: '{}'", provider);
-        eprintln!("[TRANSLATION] Using GROQ_API_KEY: {}... (len={})",
-            if groq_key.len() >= 4 { &groq_key[..4] } else { "?" },
-            groq_key.len());
-        eprintln!("[TRANSLATION] Using YANDEX_API_KEY: {}... (len={})",
-            if yandex_key.len() >= 4 { &yandex_key[..4] } else { "?" },
-            yandex_key.len());
+    pub fn new(groq_key: &str, yandex_key: &str, yandex_folder_id: &str) -> Result<Self> {
+        eprintln!("[TRANSLATION] Providers: Groq={}, Yandex={}",
+            if groq_key.len() >= 4 { &groq_key[..4] } else { "none" },
+            if yandex_key.len() >= 4 { &yandex_key[..4] } else { "none" });
+
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(15))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .context("Failed to build HTTP client")?;
+
         Ok(Self {
             groq_key: groq_key.to_string(),
             yandex_key: yandex_key.to_string(),
             yandex_folder_id: yandex_folder_id.to_string(),
-            provider: provider.to_string(),
             client,
         })
     }
@@ -85,40 +212,23 @@ impl TranslationEngine {
             return Ok(String::new());
         }
 
-        match self.provider.as_str() {
-            "groq" => {
-                if self.groq_key.len() > 4 {
-                    return self.translate_groq(text, direction);
-                }
-                bail!("Groq selected but no valid API key")
-            }
-            "yandex" => {
-                if self.yandex_key.len() > 4 {
-                    return self.translate_yandex(text, direction);
-                }
-                bail!("Yandex selected but no valid API key")
-            }
-            _ => {} // "auto" — try Groq first, fallback to Yandex
-        }
-
-        // Auto mode: try Groq first
-        if self.groq_key.len() > 4 {
+        // Try Groq first if key is available
+        if !self.groq_key.is_empty() && self.groq_key.len() > 4 {
             match self.translate_groq(text, direction) {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    let err_line = format!("[FALLBACK] Groq failed: {:#}, trying Yandex", e);
-                    eprintln!("{}", err_line);
-                    log_to_file("groq_debug.log", &err_line);
+                    eprintln!("[TRANSLATION] Groq failed: {}, trying Yandex...", e);
+                    log_to_file("groq_debug.log", &format!("Groq failed: {}, falling back to Yandex", e));
                 }
             }
         }
 
-        // Fallback to Yandex
-        if self.yandex_key.len() > 4 {
+        // Fall back to Yandex if key is available
+        if !self.yandex_key.is_empty() && self.yandex_key.len() > 4 {
             return self.translate_yandex(text, direction);
         }
 
-        bail!("No valid API keys available for translation")
+        bail!("No translation provider available. Set GROQ_API_KEY or YANDEX_API_KEY.")
     }
 
     fn translate_groq(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
@@ -151,7 +261,7 @@ impl TranslationEngine {
         let body_string = serde_json::to_string(&body).unwrap_or_default();
 
         let debug_line = format!(
-            "🔑 KEY={}...{} (len={})\n📡 GROQ req: model={}, text={}",
+            "🔑 GROQ KEY={}...{} (len={})\n📡 req: model={}, text={}",
             &self.groq_key[..4.min(self.groq_key.len())],
             &self.groq_key[32..36.min(self.groq_key.len())],
             self.groq_key.len(),
@@ -161,7 +271,6 @@ impl TranslationEngine {
         eprintln!("{}", debug_line);
         log_to_file("groq_debug.log", &debug_line);
 
-        // Retry loop: 3 attempts with exponential backoff (1s, 2s, 4s)
         let max_attempts = 3;
         let mut last_error = None;
         for attempt in 1..=max_attempts {
@@ -213,20 +322,20 @@ impl TranslationEngine {
                 Ok(r) => {
                     let status = r.status();
                     let bytes = r.bytes().unwrap_or_default();
-                    let body_text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-                    let err_line = format!("❌ GROQ error {}: {}", status, body_text);
+                    let text = String::from_utf8(bytes.to_vec()).unwrap_or_default();
+                    let err_line = format!("❌ GROQ error {}: {}", status, text);
                     eprintln!("{}", err_line);
                     log_to_file("groq_debug.log", &err_line);
                     if status.as_u16() >= 400 && status.as_u16() < 500 {
-                        bail!("Groq error {}: {}", status, body_text);
+                        bail!("Groq error {}: {}", status, text);
                     }
-                    last_error = Some(anyhow::anyhow!("Groq error {}: {}", status, body_text));
+                    last_error = Some(anyhow::anyhow!("Groq error {}: {}", status, text));
                 }
                 Err(e) => {
                     let err_line = format!("❌ GROQ request failed: {:#}", e);
                     eprintln!("{}", err_line);
                     log_to_file("groq_debug.log", &err_line);
-                    last_error = Some(anyhow::anyhow!("{}", err_line));
+                    last_error = Some(anyhow::anyhow!("{}", e));
                 }
             }
         }
@@ -235,41 +344,50 @@ impl TranslationEngine {
     }
 
     fn translate_yandex(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
-        let translator = yandex::YandexTranslator::new(&self.yandex_key, &self.yandex_folder_id)?;
+        let translator = yandex::YandexTranslator::new(
+            &self.yandex_key,
+            &self.yandex_folder_id,
+        )?;
 
-        let result = translator.translate(text, &direction.from_code, &direction.to_code)?;
+        let debug_line = format!(
+            "🔑 YANDEX KEY={}... (len={})\n📡 req: {}→{}, text={}",
+            &self.yandex_key[..4.min(self.yandex_key.len())],
+            self.yandex_key.len(),
+            direction.from_code,
+            direction.to_code,
+            text,
+        );
+        eprintln!("{}", debug_line);
+        log_to_file("groq_debug.log", &debug_line);
 
-        let out_line = format!("✅ YANDEX Output: {}", result);
+        let translated = translator.translate(text, &direction.from_code, &direction.to_code)?;
+
+        let out_line = format!("✅ YANDEX Output: {}", translated);
         eprintln!("{}", out_line);
         log_to_file("groq_debug.log", &out_line);
 
-        Ok(result)
+        Ok(translated)
     }
 }
 
 fn clean_groq_output(text: &str) -> String {
     let t = text.trim();
-    // Pattern: "something" translates to "translation"
     if let Some(pos) = t.to_lowercase().find("translates to") {
         let after = &t[pos + "translates to".len()..];
-        // Extract text between quotes
         if let Some(start) = after.find('"') {
             let rest = &after[start + 1..];
             if let Some(end) = rest.find('"') {
                 return rest[..end].to_string();
             }
         }
-        // Or first sentence after "translates to"
         let first_sentence = after.split(|c| c == '.' || c == '!' || c == '?')
             .next().unwrap_or("").trim().trim_matches('"');
         if !first_sentence.is_empty() {
             return first_sentence.to_string();
         }
     }
-    // Pattern: starts with "Russian phrase" (quoted), extract the last quoted English
     let parts: Vec<&str> = t.split('"').collect();
     if parts.len() >= 3 {
-        // Try last quoted segment
         if let Some(last) = parts.last() {
             let candidate = last.trim();
             if !candidate.is_empty() && candidate.len() < 100 {
@@ -277,7 +395,6 @@ fn clean_groq_output(text: &str) -> String {
             }
         }
     }
-    // If output contains verbose patterns, strip first sentence
     let verbose_patterns = ["okay", "let's see", "the user said", "the user wrote",
                             "translates to", "breaking it down", "first,", "i need to",
                             "putting it together", "let me break"];
@@ -322,3 +439,100 @@ struct GroqChoice {
 struct GroqMessage {
     content: String,
 }
+```
+
+- [ ] **Step 2: Verify it compiles**
+
+Run: `cd native/audio_engine && cargo check --lib 2>&1 | head -20`
+Expected: No errors
+
+---
+
+## Task 3: Update Elixir to Pass Yandex Keys
+
+**Files:**
+- Modify: `lib/translator/audio_engine.ex:279`
+
+- [ ] **Step 1: Add YANDEX_API_KEY and YANDEX_FOLDER_ID env vars**
+
+Find the `{:env, [...]}` block in `audio_engine.ex` and add after the GROQ_API_KEY line:
+
+```elixir
+{~c"YANDEX_API_KEY", charlist_setting(settings, "yandex_api_key", "YANDEX_API_KEY")},
+{~c"YANDEX_FOLDER_ID", charlist_setting(settings, "yandex_folder_id", "YANDEX_FOLDER_ID")},
+```
+
+- [ ] **Step 2: Update Rust engine.rs to read the new env vars**
+
+In `native/audio_engine/src/engine.rs`, find where `groq_api_key` is read and add:
+
+```rust
+let yandex_key = std::env::var("YANDEX_API_KEY").unwrap_or_default();
+let yandex_folder_id = std::env::var("YANDEX_FOLDER_ID").unwrap_or_default();
+```
+
+Then update the `TranslationEngine::new()` call to pass both keys:
+
+```rust
+TranslationEngine::new(&self.config.groq_api_key, &yandex_key, &yandex_folder_id)
+```
+
+---
+
+## Task 4: Update Settings and UI
+
+**Files:**
+- Modify: `web/settings.py`
+- Modify: `settings.json`
+
+- [ ] **Step 1: Add yandex_api_key to DEFAULT_SETTINGS in settings.py**
+
+```python
+DEFAULT_SETTINGS = {
+    "deepgram_api_key": "",
+    "groq_api_key": "",
+    "yandex_api_key": "",
+    "yandex_folder_id": "",
+    # ... rest unchanged
+}
+```
+
+- [ ] **Step 2: Add keys to settings.json**
+
+```json
+{
+  "deepgram_api_key": "...",
+  "groq_api_key": "...",
+  "yandex_api_key": "",
+  "yandex_folder_id": "",
+  ...
+}
+```
+
+---
+
+## Task 5: Test the Integration
+
+- [ ] **Step 1: Compile Rust engine**
+
+Run: `cd native/audio_engine && cargo build --release 2>&1 | tail -5`
+Expected: `Finished release profile`
+
+- [ ] **Step 2: Compile Elixir**
+
+Run: `mix compile 2>&1 | tail -5`
+Expected: `Generated translator app`
+
+- [ ] **Step 3: Start the app and verify engine starts**
+
+Run the app, check logs for `[TRANSLATION] Providers: Groq=..., Yandex=...`
+
+---
+
+## Verification Checklist
+
+1. [ ] Rust compiles without errors
+2. [ ] Elixir compiles without errors
+3. [ ] Engine starts and shows both providers in logs
+4. [ ] If Groq key is invalid, falls back to Yandex automatically
+5. [ ] Translation works bidirectionally (ru→en, en→ru)

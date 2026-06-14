@@ -18,9 +18,11 @@ from .settings import (
 )
 from .db import _get_db, _ensure_call, _close_call, _record_line, _call_lock
 from .helpers import (
-    call_groq, send_engine_command,
+    call_groq, call_yandex, send_engine_command,
     get_voice_catalog, scan_voices, list_audio_devices,
+    get_yandex_key, get_yandex_folder_id,
 )
+from .settings import get_groq_key
 
 logger = logging.getLogger("translator")
 
@@ -240,7 +242,7 @@ def register_routes(app):
 
     @app.route("/api/translate", methods=["POST"])
     def api_translate():
-        """Translate text via Groq LLM (used by tab capture)."""
+        """Translate text via Groq or Yandex (used by tab capture)."""
         data = request.get_json()
         text = data.get("text", "").strip()
         from_lang = data.get("from", "en")
@@ -248,48 +250,80 @@ def register_routes(app):
         if not text:
             return jsonify({"translation": ""})
 
-        lang_names = {
-            "ar": "Arabic", "ca": "Catalan", "cs": "Czech", "da": "Danish",
-            "de": "German", "el": "Greek", "en": "English", "es": "Spanish",
-            "fa": "Persian", "fi": "Finnish", "fr": "French", "hi": "Hindi",
-            "hu": "Hungarian", "id": "Indonesian", "it": "Italian", "ja": "Japanese",
-            "ko": "Korean", "lv": "Latvian", "nl": "Dutch", "no": "Norwegian",
-            "pl": "Polish", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian",
-            "sv": "Swedish", "tr": "Turkish", "uk": "Ukrainian", "vi": "Vietnamese",
-            "zh": "Chinese",
-        }
-        from_name = lang_names.get(from_lang, from_lang)
-        to_name = lang_names.get(to_lang, to_lang)
+        settings = load_settings()
+        provider = settings.get("translation_provider", "auto")
 
-        api_key = get_groq_key()
-        if not api_key:
-            return jsonify({"translation": text, "error": "no groq key"})
-        system_prompt = (
-            f"You are a live interpreter in a phone call. "
-            f"You hear {from_name}, you say the same thing in {to_name}. "
-            f"You translate word for word. "
-            f"You have no opinions, no knowledge, no personality. "
-            f"You are a transparent pipe between two languages.\n"
-            f"Rules:\n"
-            f"- Output ONLY the {to_name} translation, nothing else.\n"
-            f"- Keep the same tone, register, and emotion.\n"
-            f"- Translate profanity as equivalent profanity.\n"
-            f"- Keep names and proper nouns as-is (transliterate if needed).\n"
-            f"- For filler words (well, uh, like) use natural equivalents.\n"
-            f"- Never add explanations, notes, or commentary."
-        )
+        # If provider is "yandex" or "auto" with no Groq key, try Yandex first
+        if provider == "yandex" or (provider == "auto" and not get_groq_key()):
+            yandex_key = get_yandex_key()
+            yandex_folder = get_yandex_folder_id()
+            if yandex_key and yandex_folder:
+                try:
+                    translation = call_yandex(text, from_lang, to_lang, yandex_key, yandex_folder)
+                    logger.info("[TAB TRANSLATE Yandex] '%s' -> '%s'", text, translation)
+                    return jsonify({"translation": translation})
+                except Exception as e:
+                    if provider == "yandex":
+                        logger.error("[TAB TRANSLATE Yandex ERROR] '%s' -> %s", text, e)
+                        return jsonify({"translation": text, "error": str(e)})
+                    logger.warning("[TAB TRANSLATE Yandex failed] %s, trying Groq...", e)
 
-        try:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ]
-            translation = call_groq(messages, api_key, temperature=0.1, max_tokens=80)
-            logger.info("[TAB TRANSLATE] '%s' -> '%s'", text, translation)
-            return jsonify({"translation": translation})
-        except Exception as e:
-            logger.error("[TAB TRANSLATE ERROR] '%s' -> %s", text, e)
-            return jsonify({"translation": text, "error": str(e)})
+        # Try Groq (default or fallback)
+        groq_key = get_groq_key()
+        if groq_key:
+            try:
+                lang_names = {
+                    "ar": "Arabic", "ca": "Catalan", "cs": "Czech", "da": "Danish",
+                    "de": "German", "el": "Greek", "en": "English", "es": "Spanish",
+                    "fa": "Persian", "fi": "Finnish", "fr": "French", "hi": "Hindi",
+                    "hu": "Hungarian", "id": "Indonesian", "it": "Italian", "ja": "Japanese",
+                    "ko": "Korean", "lv": "Latvian", "nl": "Dutch", "no": "Norwegian",
+                    "pl": "Polish", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian",
+                    "sv": "Swedish", "tr": "Turkish", "uk": "Ukrainian", "vi": "Vietnamese",
+                    "zh": "Chinese",
+                }
+                from_name = lang_names.get(from_lang, from_lang)
+                to_name = lang_names.get(to_lang, to_lang)
+                system_prompt = (
+                    f"You are a live interpreter in a phone call. "
+                    f"You hear {from_name}, you say the same thing in {to_name}. "
+                    f"You translate word for word. "
+                    f"You have no opinions, no knowledge, no personality. "
+                    f"You are a transparent pipe between two languages.\n"
+                    f"Rules:\n"
+                    f"- Output ONLY the {to_name} translation, nothing else.\n"
+                    f"- Keep the same tone, register, and emotion.\n"
+                    f"- Translate profanity as equivalent profanity.\n"
+                    f"- Keep names and proper nouns as-is (transliterate if needed).\n"
+                    f"- For filler words (well, uh, like) use natural equivalents.\n"
+                    f"- Never add explanations, notes, or commentary."
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ]
+                translation = call_groq(messages, groq_key, temperature=0.1, max_tokens=80)
+                logger.info("[TAB TRANSLATE Groq] '%s' -> '%s'", text, translation)
+                return jsonify({"translation": translation})
+            except Exception as e:
+                if provider == "groq":
+                    logger.error("[TAB TRANSLATE Groq ERROR] '%s' -> %s", text, e)
+                    return jsonify({"translation": text, "error": str(e)})
+                logger.warning("[TAB TRANSLATE Groq failed] %s, trying Yandex...", e)
+
+        # Final fallback: Yandex
+        yandex_key = get_yandex_key()
+        yandex_folder = get_yandex_folder_id()
+        if yandex_key and yandex_folder:
+            try:
+                translation = call_yandex(text, from_lang, to_lang, yandex_key, yandex_folder)
+                logger.info("[TAB TRANSLATE Yandex fallback] '%s' -> '%s'", text, translation)
+                return jsonify({"translation": translation})
+            except Exception as e:
+                logger.error("[TAB TRANSLATE Yandex ERROR] '%s' -> %s", text, e)
+                return jsonify({"translation": text, "error": str(e)})
+
+        return jsonify({"translation": text, "error": "no translation provider available"})
 
     @app.route("/api/calls/new-session", methods=["POST"])
     def api_new_session():

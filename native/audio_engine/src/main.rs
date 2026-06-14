@@ -12,10 +12,26 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
+use cpal::traits::{DeviceTrait, HostTrait};
 use log::{debug, error, info};
 
 use crate::engine::{Engine, EngineConfig};
 use crate::protocol::{read_command, write_event, Event};
+
+fn log_audio_devices() {
+    let host = cpal::default_host();
+    tracelog::trace("engine", "DEVICE", &format!("Available audio devices on host '{}':", host.id().name()));
+    if let Ok(devices) = host.devices() {
+        for device in devices {
+            let name = device.name().unwrap_or_else(|_| "?".into());
+            let is_input = device.supported_input_configs().map(|mut c| c.next().is_some()).unwrap_or(false);
+            let is_output = device.supported_output_configs().map(|mut c| c.next().is_some()).unwrap_or(false);
+            tracelog::trace("engine", "DEVICE", &format!("  {} (input={}, output={})", name, is_input, is_output));
+        }
+    }
+    tracelog::trace("engine", "DEVICE", "--- end device list ---");
+    info!("Audio device enumeration complete");
+}
 
 fn main() -> Result<()> {
     // Logger writes to stderr — stdout is reserved for the protocol channel.
@@ -29,6 +45,21 @@ fn main() -> Result<()> {
     tracelog::init_log();
     tracelog::prune_old_logs();
     tracelog::trace("engine", "INIT", "audio_engine started, trace logging active");
+
+    // Log key env vars for device routing diagnostics
+    for var in &["TRANSLATOR_MIC_DEVICE", "TRANSLATOR_SPEAKER_DEVICE",
+                 "TRANSLATOR_MEET_INPUT", "TRANSLATOR_MEET_OUTPUT",
+                 "DEEPGRAM_API_KEY", "GROQ_API_KEY",
+                 "TRANSLATOR_MY_LANG", "TRANSLATOR_THEIR_LANG"] {
+        let val = std::env::var(var).unwrap_or_default();
+        let display = if var.contains("API_KEY") && val.len() > 8 {
+            format!("{}...", &val[..8])
+        } else {
+            val
+        };
+        tracelog::trace("engine", "ENV", &format!("{}='{}'", var, display));
+    }
+    log_audio_devices();
 
     // ONNX Runtime init is deferred to the TTS preload thread (engine.rs)
     // to avoid COM conflicts with WASAPI audio capture.
