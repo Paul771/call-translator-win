@@ -31,49 +31,26 @@ impl AudioPlayback {
             .name()
             .unwrap_or_else(|_| "unknown".into());
 
-        // Windows WASAPI often requires specific sample rates.
-        // Find the closest supported config to the requested sample_rate to avoid speed mismatch.
-        let mut supported = device
-            .supported_output_configs()
-            .context("Failed to query supported output configs")?;
+        // Use the device's DEFAULT config — this is the rate the hardware actually uses.
+        // Trying to force a different rate via WASAPI often silently fails and the device
+        // uses its native rate, causing audio to play at wrong speed.
+        let default_config = device
+            .default_output_config()
+            .context("Failed to get default output config")?;
 
-        // Find config with sample rate closest to requested (48000Hz for TTS)
-        let mut best_config = None;
-        for cfg in supported.by_ref() {
-            let min_rate = cfg.min_sample_rate().0;
-            let max_rate = cfg.max_sample_rate().0;
-            if _sample_rate >= min_rate && _sample_rate <= max_rate {
-                best_config = Some(cfg);
-                break;
-            }
-            if best_config.is_none() {
-                best_config = Some(cfg);
-            }
-        }
-
-        let config_range = best_config
-            .context("No compatible output configuration found for this device")?;
-
-        // Use the requested sample rate if supported, otherwise use max from range
-        let sample_rate = if _sample_rate >= config_range.min_sample_rate().0
-            && _sample_rate <= config_range.max_sample_rate().0
-        {
-            cpal::SampleRate(_sample_rate)
-        } else {
-            config_range.max_sample_rate()
-        };
+        let native_rate = default_config.sample_rate().0;
+        let channels = default_config.channels();
 
         let config = StreamConfig {
-            channels: config_range.channels(),
-            sample_rate,
+            channels,
+            sample_rate: cpal::SampleRate(native_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let actual_sample_rate = config.sample_rate.0;
-        let _channels = config.channels;
+        let actual_sample_rate = native_rate;
 
         tracelog::trace("playback", "DEVICE", &format!(
-            "Playback device '{}' rate={}Hz (requested {}Hz)",
+            "Playback device '{}' native_rate={}Hz (requested {}Hz)",
             actual_name, actual_sample_rate, _sample_rate
         ));
         let ring_size = actual_sample_rate as usize * 10;
@@ -139,6 +116,10 @@ impl AudioPlayback {
             .context("Failed to pause playback stream")?;
         info!("Playback stopped on '{}'", self.device_name);
         Ok(())
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate.0
     }
 }
 

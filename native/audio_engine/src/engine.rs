@@ -514,6 +514,9 @@ fn run_pipeline(
     let playback = AudioPlayback::new(playback_device, sample_rate, playback_rx)
         .with_context(|| format!("[{}] Failed to create AudioPlayback", direction))?;
 
+    // Use the playback device's NATIVE rate for TTS — this matches what the hardware uses
+    let playback_rate = playback.sample_rate();
+
     // Connect to Deepgram — stream at 16kHz to save bandwidth
     let stt_sample_rate = 16_000_u32;
     let mut session = stt
@@ -540,7 +543,7 @@ fn run_pipeline(
     let proc_event_tx = event_tx.clone();
     let proc_direction = direction.to_string();
     let proc_source_lang = source_lang.to_string();
-    let proc_sample_rate = sample_rate;
+    let proc_sample_rate = playback_rate;
     let _proc_tts_config = tts_config.to_string();
     let _proc_tts_model = tts_model.to_string();
     // Pre-load TTS in background.
