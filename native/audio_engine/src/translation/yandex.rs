@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 pub struct YandexTranslator {
     api_key: String,
     folder_id: String,
-    client: reqwest::blocking::Client,
 }
 
 impl YandexTranslator {
@@ -13,15 +12,9 @@ impl YandexTranslator {
         eprintln!("[YANDEX] Using API key: {}... (len={})",
             if api_key.len() >= 4 { &api_key[..4] } else { "?" },
             api_key.len());
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .context("Failed to build Yandex HTTP client")?;
         Ok(Self {
             api_key: api_key.to_string(),
             folder_id: folder_id.to_string(),
-            client,
         })
     }
 
@@ -43,7 +36,14 @@ impl YandexTranslator {
             source_lang, target_lang,
             if text.len() > 50 { &text[..50] } else { text });
 
-        let response = self.client
+        // Create a new client per request with strict 10s timeout to prevent hangs
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .context("Failed to build Yandex HTTP client")?;
+
+        let response = client
             .post("https://translate.api.cloud.yandex.net/translate/v2/translate")
             .header("Authorization", format!("Api-Key {}", self.api_key))
             .header("Content-Type", "application/json; charset=utf-8")
