@@ -8,6 +8,8 @@ use ringbuf::{
     HeapRb,
 };
 
+use crate::tracelog;
+
 /// Plays audio received from a channel to a named output device.
 #[allow(dead_code)]
 pub struct AudioPlayback {
@@ -28,8 +30,6 @@ impl AudioPlayback {
         let actual_name = device
             .name()
             .unwrap_or_else(|_| "unknown".into());
-
-        eprintln!("[PLAYBACK] Using device: '{}' (requested: '{}')", actual_name, device_name);
 
         // Windows WASAPI often requires specific sample rates.
         // Find the closest supported config to the requested sample_rate to avoid speed mismatch.
@@ -70,14 +70,12 @@ impl AudioPlayback {
         };
 
         let actual_sample_rate = config.sample_rate.0;
-        let channels = config.channels;
+        let _channels = config.channels;
 
-        info!(
-            "Opening playback device '{}': rate={}Hz, channels={}",
-            actual_name, actual_sample_rate, channels
-        );
-
-        // Ring buffer: 10 seconds
+        tracelog::trace("playback", "DEVICE", &format!(
+            "Playback device '{}' rate={}Hz (requested {}Hz)",
+            actual_name, actual_sample_rate, _sample_rate
+        ));
         let ring_size = actual_sample_rate as usize * 10;
         let ring = HeapRb::<f32>::new(ring_size);
         let (mut producer, mut consumer) = ring.split();
