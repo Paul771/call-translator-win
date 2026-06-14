@@ -649,7 +649,8 @@ fn run_pipeline(
             if _audio_len > 0 {
                 _proc_echo.store(true, Ordering::SeqCst);
                 let es = _proc_echo.clone();
-                let dur_ms = (_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 500;
+                // Suppress for 2 seconds after TTS finishes to prevent echo pickup
+                let dur_ms = (_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 2000;
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(dur_ms));
                     es.store(false, Ordering::SeqCst);
@@ -704,19 +705,28 @@ fn run_pipeline(
         // Send ALL available audio chunks to Deepgram (non-blocking, buffered on WouldBlock)
         let mut chunks_sent = 0usize;
         for chunk in audio_rx.try_iter().take(10) {
-            if !mute_flag.load(Ordering::Relaxed) {
-                let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
-                let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
-                if chunks_sent < 3 {
-                    tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}", samples_16k.len(), rms));
-                }
-                if let Err(e) = session.send_audio(&samples_16k) {
-                    warn!("[{}] Deepgram send error: {:#}", direction, e);
-                    tracelog::trace(direction, "STT", &format!("SEND_ERROR: {}", e));
-                    need_reconnect = true;
+            if mute_flag.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Echo suppression: skip audio capture while other pipeline is playing TTS
+            if my_suppress.load(Ordering::SeqCst) {
+                if chunks_sent == 0 {
+                    tracelog::trace(direction, "CAPTURE", "ECHO_SUPPRESSED — dropping audio chunks while other pipeline plays TTS");
                 }
                 chunks_sent += 1;
+                continue;
             }
+            let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
+            let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
+            if chunks_sent < 3 {
+                tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}", samples_16k.len(), rms));
+            }
+            if let Err(e) = session.send_audio(&samples_16k) {
+                warn!("[{}] Deepgram send error: {:#}", direction, e);
+                tracelog::trace(direction, "STT", &format!("SEND_ERROR: {}", e));
+                need_reconnect = true;
+            }
+            chunks_sent += 1;
         }
         if chunks_sent > 3 {
             tracelog::trace(direction, "CAPTURE", &format!("... {} more chunks sent to Deepgram", chunks_sent - 3));
