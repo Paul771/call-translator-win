@@ -813,13 +813,23 @@ fn process_utterance(
     // === TRANSLATION ===
     tracelog::trace(direction, "TRANSLATE", &format!("translating '{}' ...", text));
     let translate_start = Instant::now();
-    let translated = match translator.translate(text, translate_direction) {
-        Ok(t) => {
+
+    // Run translation in a separate thread with a hard 12-second timeout
+    // to prevent processor thread from blocking forever on hung HTTP requests
+    let translate_text = text.to_string();
+    let translate_dir = translate_direction.clone();
+    let translator_clone = translator.clone();
+    let translate_handle = std::thread::spawn(move || {
+        translator_clone.translate(&translate_text, &translate_dir)
+    });
+
+    let translated = match translate_handle.join() {
+        Ok(Ok(t)) => {
             let ms = translate_start.elapsed().as_millis() as u64;
             tracelog::trace(direction, "TRANSLATE", &format!("OK {}ms result='{}'", ms, t));
             t
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let ms = translate_start.elapsed().as_millis() as u64;
             error!("[{}] Translation error: {:#}", direction, e);
             tracelog::trace(direction, "ERROR", &format!("TRANSLATION_FAILED {}ms: {}", ms, e));
@@ -828,7 +838,23 @@ fn process_utterance(
             });
             return 0;
         }
+        Err(_panic) => {
+            let ms = translate_start.elapsed().as_millis() as u64;
+            error!("[{}] Translation thread panicked", direction);
+            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_PANIC {}ms", ms));
+            return 0;
+        }
     };
+
+    // Hard timeout check: if translation took more than 12 seconds, skip it
+    let translate_elapsed = translate_start.elapsed().as_millis() as u64;
+    if translate_elapsed > 12000 {
+        tracelog::trace(direction, "ERROR", &format!("TRANSLATION_TIMEOUT {}ms — skipping", translate_elapsed));
+        let _ = event_tx.try_send(Event::Error {
+            message: format!("[{}] Translation timed out after {}ms", direction, translate_elapsed),
+        });
+        return 0;
+    }
 
     let translate_ms = translate_start.elapsed().as_millis() as u64;
 
