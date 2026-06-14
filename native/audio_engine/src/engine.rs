@@ -504,7 +504,8 @@ fn run_pipeline(
     let (audio_tx, audio_rx) = bounded::<AudioChunk>(512);
     let (playback_tx, playback_rx) = bounded::<Vec<f32>>(64);
     // Transcripts go here; the processor thread picks them up without blocking audio.
-    let (proc_tx, proc_rx) = bounded::<(String, u64)>(16);
+    // Increased from 16 to 64 to handle Yandex API latency (~1.2s per translation)
+    let (proc_tx, proc_rx) = bounded::<(String, u64)>(64);
 
     let capture = AudioCapture::new(capture_device, audio_tx)
         .with_context(|| format!("[{}] Failed to create AudioCapture", direction))?;
