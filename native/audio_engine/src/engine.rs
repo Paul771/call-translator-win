@@ -624,15 +624,28 @@ fn run_pipeline(
                     });
                     let _ = tts_ready_tx.send(None);
                 }
-                Err(_timeout) => {
-                    tracelog::trace(&proc_direction_bg, "TTS", &format!("TTS preload timed out after {}s — disabling TTS", init_timeout.as_secs()));
-                    let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
-                        direction: proc_direction_bg.clone(),
-                        status: "timeout".into(),
-                        message: format!("init timed out after {}s — ONNX hang?", init_timeout.as_secs()),
-                    });
-                    let _ = tts_ready_tx.send(None);
-                }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let ms = translate_start.elapsed().as_millis() as u64;
+            error!("[{}] Translation thread crashed after {}ms", direction, ms);
+            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_CRASHED {}ms", ms));
+            let _ = event_tx.try_send(Event::Translation {
+                direction: direction.to_string(),
+                text: "ERROR: translator crashed".to_string(),
+                translate_ms: ms,
+            });
+            return 0;
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let ms = translate_start.elapsed().as_millis() as u64;
+            error!("[{}] Translation timed out after {}ms (limit {}s)", direction, ms, TRANSLATE_TIMEOUT_SECS);
+            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_TIMEOUT {}ms — skipping", ms));
+            let _ = event_tx.try_send(Event::Translation {
+                direction: direction.to_string(),
+                text: format!("TIMEOUT after {}ms", ms),
+                translate_ms: ms,
+            });
+            return 0;
+        }
             }
         });
 
@@ -862,7 +875,18 @@ fn process_utterance(
             });
             return 0;
         }
-        Err(_timeout) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let ms = translate_start.elapsed().as_millis() as u64;
+            error!("[{}] Translation thread died (panicked?) after {}ms", direction, ms);
+            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_THREAD_DIED {}ms", ms));
+            let _ = event_tx.try_send(Event::Translation {
+                direction: direction.to_string(),
+                text: "ERROR: translator crashed".to_string(),
+                translate_ms: ms,
+            });
+            return 0;
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let ms = translate_start.elapsed().as_millis() as u64;
             error!("[{}] Translation timed out after {}ms (limit {}s)", direction, ms, TRANSLATE_TIMEOUT_SECS);
             tracelog::trace(direction, "ERROR", &format!("TRANSLATION_TIMEOUT {}ms — skipping", ms));
