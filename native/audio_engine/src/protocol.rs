@@ -41,12 +41,15 @@ pub enum Event {
         direction: String,
         text: String,
         lang: String,
+        stt_ms: u64,
     },
     Translation {
         direction: String,
         text: String,
+        translate_ms: u64,
     },
     Metrics {
+        direction: String,
         stt_ms: u64,
         translate_ms: u64,
         tts_ms: u64,

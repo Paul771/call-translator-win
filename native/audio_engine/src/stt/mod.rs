@@ -38,9 +38,6 @@ impl DeepgramStt {
     }
 
     pub fn create_session(&self, sample_rate: u32) -> Result<DeepgramSession> {
-        // NOTE: intentionally NOT using keepalive=true — it conflicts with non-blocking
-        // tungstenite on Windows and causes immediate 10054 disconnects. Instead we rely
-        // on sending audio frames regularly to keep the connection alive.
         let url_str = if self.language == "any" {
             format!(
                 "wss://api.deepgram.com/v1/listen\
@@ -74,7 +71,6 @@ impl DeepgramStt {
 
         tracelog::trace("stt", "STT", &format!("connecting lang={} rate={}Hz endpointing={}ms",
             self.language, sample_rate, self.endpointing_ms));
-        tracelog::trace("stt", "STT", &format!("URL: {}", url_str));
 
         let mut request = url_str
             .into_client_request()
@@ -92,7 +88,6 @@ impl DeepgramStt {
         );
         log_file(&format!("connecting lang={} rate={} endpointing={}ms", self.language, sample_rate, self.endpointing_ms));
 
-        // Timeout wrapper: connect with a 15-second limit
         let (connect_tx, connect_rx) = std::sync::mpsc::channel();
         let connect_timeout = Duration::from_secs(15);
         std::thread::spawn(move || {
@@ -113,11 +108,11 @@ impl DeepgramStt {
         log_file(&format!("WS connected status={}", resp.status()));
         tracelog::trace("stt", "STT", &format!("WS connected status={}", resp.status()));
 
-        // Socket stays non-blocking at all times.
-        // On WouldBlock we buffer audio and flush on next iteration.
+        // Non-blocking mode for real-time audio streaming.
+        // Audio is sent every loop iteration to keep Deepgram connection alive.
         set_nonblocking(&mut ws)?;
 
-        info!("Deepgram session connected");
+        info!("Deepgram session connected (non-blocking mode)");
         Ok(DeepgramSession {
             ws,
             last_send_time: Instant::now(),
@@ -127,7 +122,7 @@ impl DeepgramStt {
     }
 }
 
-const MAX_PENDING_AUDIO: usize = 65536; // 64KB cap for non-blocking send buffer
+const MAX_PENDING_AUDIO: usize = 65536;
 
 pub struct DeepgramSession {
     ws: WebSocket<MaybeTlsStream<std::net::TcpStream>>,
@@ -152,20 +147,13 @@ impl DeepgramSession {
             })
             .collect();
 
-        let byte_len = bytes.len();
-
-        // Always non-blocking. If the TCP send buffer is full (WouldBlock),
-        // buffer the audio and flush on the next pipeline iteration.
-        // This prevents the pipeline from blocking on backpressure.
         match self.ws.send(Message::Binary(bytes)) {
             Ok(()) => {
                 self.last_send_time = Instant::now();
-                tracelog::trace("stt", "STT", &format!("audio sent: {} bytes", byte_len));
                 Ok(())
             }
             Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock => {
-                tracelog::trace("stt", "STT", &format!("send WouldBlock — buffering {} bytes", byte_len));
-                // bytes was consumed by ws.send, re-encode for buffer
+                // Buffer for next flush
                 let rebuf: Vec<u8> = samples
                     .iter()
                     .flat_map(|&s| {
@@ -177,7 +165,6 @@ impl DeepgramSession {
                 if self.pending_audio.len() > MAX_PENDING_AUDIO {
                     let excess = self.pending_audio.len() - MAX_PENDING_AUDIO;
                     self.pending_audio.drain(..excess);
-                    tracelog::trace("stt", "STT", &format!("pending buffer capped, dropped {} oldest bytes", excess));
                 }
                 Ok(())
             }
@@ -194,36 +181,23 @@ impl DeepgramSession {
         }
         match self.ws.send(Message::Binary(self.pending_audio.clone())) {
             Ok(()) => {
-                tracelog::trace("stt", "STT", &format!("flushed {} buffered bytes", self.pending_audio.len()));
                 self.pending_audio.clear();
                 self.last_send_time = Instant::now();
                 Ok(())
             }
             Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock => {
-                tracelog::trace("stt", "STT", &format!("flush WouldBlock — {} still buffered", self.pending_audio.len()));
                 Ok(())
             }
             Err(e) => {
-                tracelog::trace("stt", "ERROR", &format!("WS flush failed: {}", e));
                 Err(anyhow::anyhow!("Failed to flush pending audio: {}", e))
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn reset_pending(&mut self) {
-        self.pending_audio.clear();
     }
 
     pub fn poll_transcript(&mut self) -> Result<Option<SttResult>> {
         loop {
             match self.ws.read() {
                 Ok(Message::Text(text)) => {
-                    // Detailed response logging is now handled by tracelog in the transcript branch below.
-                    // Hex debug logging to deepgram_debug.log removed to save disk space.
-                    // Deepgram sends `channel` as `[0,1]` (array) in SpeechStarted/UtteranceEnd events
-                    // and as `{"alternatives": [...]}` in transcription results.
-                    // Use serde_json::Value to handle both formats.
                     match serde_json::from_str::<DgResponse>(&text) {
                         Ok(resp) => {
                             let transcript = resp
@@ -239,14 +213,11 @@ impl DeepgramSession {
                             let is_final = resp.is_final == Some(true);
                             if is_final && !transcript.trim().is_empty() {
                                 let since_last = self.last_send_time.elapsed().as_millis() as u64;
-                                tracelog::trace("stt", "STT", &format!("✅ FINAL stt={}ms text='{}'", since_last, transcript));
+                                tracelog::trace("stt", "STT", &format!("FINAL stt={}ms text='{}'", since_last, transcript));
                                 return Ok(Some(SttResult { text: transcript, stt_latency_ms: since_last }));
                             } else if is_final {
-                                let since_last = self.last_send_time.elapsed().as_millis() as u64;
-                                tracelog::trace("stt", "STT", &format!("⚠ FINAL but EMPTY stt={}ms (silence or noise only)", since_last));
                                 return Ok(None);
                             } else {
-                                // interim result — log only if non-empty and at debug level
                                 if !transcript.trim().is_empty() {
                                     tracelog::trace("stt", "STT", &format!("interim: '{}'", transcript));
                                 }
@@ -304,23 +275,6 @@ fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> R
             s.get_ref()
                 .set_nonblocking(true)
                 .context("set_nonblocking (tls)")?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn set_blocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> Result<()> {
-    match ws.get_mut() {
-        MaybeTlsStream::Plain(s) => {
-            s.set_nonblocking(false)
-                .context("set_blocking (plain)")?;
-        }
-        MaybeTlsStream::NativeTls(s) => {
-            s.get_ref()
-                .set_nonblocking(false)
-                .context("set_blocking (tls)")?;
         }
         _ => {}
     }

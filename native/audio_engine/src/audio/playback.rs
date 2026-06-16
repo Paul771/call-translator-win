@@ -121,6 +121,10 @@ impl AudioPlayback {
     pub fn sample_rate(&self) -> u32 {
         self.config.sample_rate.0
     }
+
+    pub fn channels(&self) -> u16 {
+        self.config.channels
+    }
 }
 
 /// Find an output device by name. `"default"` returns the default output device.

@@ -247,7 +247,19 @@ impl Engine {
                                 let (tx, rx) = crossbeam_channel::bounded(4);
                                 match AudioPlayback::new(&speaker, sr, rx) {
                                     Ok(playback) => {
-                                        let _ = tx.send(samples);
+                                        let channels = playback.channels();
+                                        let stereo_samples = if channels > 1 {
+                                            let mut expanded = Vec::with_capacity(samples.len() * channels as usize);
+                                            for &s in &samples {
+                                                for _ in 0..channels {
+                                                    expanded.push(s);
+                                                }
+                                            }
+                                            expanded
+                                        } else {
+                                            samples
+                                        };
+                                        let _ = tx.send(stereo_samples);
                                         drop(tx);
                                         // Wait for playback to finish
                                         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -516,6 +528,12 @@ fn run_pipeline(
 
     // Use the playback device's NATIVE rate for TTS — this matches what the hardware uses
     let playback_rate = playback.sample_rate();
+    let playback_channels = playback.channels();
+
+    tracelog::trace(direction, "DEVICE", &format!(
+        "Playback: rate={}Hz channels={} (mono TTS will be expanded to {}ch)",
+        playback_rate, playback_channels, playback_channels
+    ));
 
     // Connect to Deepgram — stream at 16kHz to save bandwidth
     let stt_sample_rate = 16_000_u32;
@@ -544,6 +562,7 @@ fn run_pipeline(
     let proc_direction = direction.to_string();
     let proc_source_lang = source_lang.to_string();
     let proc_sample_rate = playback_rate;
+    let proc_playback_channels = playback_channels;
     let _proc_tts_config = tts_config.to_string();
     let _proc_tts_model = tts_model.to_string();
     // Pre-load TTS in background.
@@ -642,6 +661,7 @@ fn run_pipeline(
                 &proc_source_lang,
                 &mut tts,
                 proc_sample_rate,
+                proc_playback_channels,
                 &proc_playback_tx,
                 &proc_event_tx,
             );
@@ -699,14 +719,7 @@ fn run_pipeline(
             }
         }
 
-        // Flush any buffered audio before sending new data
-        if let Err(e) = session.flush_pending() {
-            warn!("[{}] Deepgram flush error: {:#}", direction, e);
-            need_reconnect = true;
-            continue;
-        }
-
-        // Send ALL available audio chunks to Deepgram (non-blocking, buffered on WouldBlock)
+        // Send ALL available audio chunks to Deepgram
         let mut chunks_sent = 0usize;
         for chunk in audio_rx.try_iter().take(10) {
             if mute_flag.load(Ordering::Relaxed) {
@@ -721,20 +734,19 @@ fn run_pipeline(
                 continue;
             }
             let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
-            let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
             if chunks_sent < 3 {
+                let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
                 tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}", samples_16k.len(), rms));
             }
             if let Err(e) = session.send_audio(&samples_16k) {
                 warn!("[{}] Deepgram send error: {:#}", direction, e);
-                tracelog::trace(direction, "STT", &format!("SEND_ERROR: {}", e));
                 need_reconnect = true;
+                break;
             }
             chunks_sent += 1;
         }
-        if chunks_sent > 3 {
-            tracelog::trace(direction, "CAPTURE", &format!("... {} more chunks sent to Deepgram", chunks_sent - 3));
-        }
+        // Flush any pending buffered audio (from previous WouldBlock)
+        let _ = session.flush_pending();
 
         loop_count += 1;
         if loop_count % diag_interval == 0 {
@@ -744,12 +756,7 @@ fn run_pipeline(
             });
         }
 
-        // Brief sleep when idle to avoid busy-waiting
-        if audio_rx.len() == 0 {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        // Poll for completed utterances (non-blocking) — just queue, don't process here
+        // Non-blocking poll — returns immediately on WouldBlock
         match session.poll_transcript() {
             Ok(Some(result)) => {
                 tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
@@ -774,6 +781,11 @@ fn run_pipeline(
                 });
                 need_reconnect = true;
             }
+        }
+
+        // Brief sleep to avoid busy-waiting on non-blocking reads
+        if chunks_sent == 0 {
+            std::thread::sleep(Duration::from_millis(2));
         }
 
     }
@@ -801,6 +813,7 @@ fn process_utterance(
     source_lang: &str,
     tts: &mut Option<TtsEngine>,
     sample_rate: u32,
+    playback_channels: u16,
     playback_tx: &Sender<Vec<f32>>,
     event_tx: &Sender<Event>,
 ) -> usize {
@@ -810,6 +823,7 @@ fn process_utterance(
         direction: direction.to_string(),
         text: text.to_string(),
         lang: source_lang.to_string(),
+        stt_ms,
     });
     tracelog::trace(direction, "EVENT", "transcript event sent to Elixir ✓");
 
@@ -817,16 +831,21 @@ fn process_utterance(
     tracelog::trace(direction, "TRANSLATE", &format!("translating '{}' ...", text));
     let translate_start = Instant::now();
 
-    // Run translation in a separate thread with a hard 12-second timeout
-    // to prevent processor thread from blocking forever on hung HTTP requests
+    // Run translation in a separate thread with a hard timeout via channel.
+    // Using join() directly has no timeout and blocks the processor forever if HTTP hangs.
+    const TRANSLATE_TIMEOUT_SECS: u64 = 12;
     let translate_text = text.to_string();
     let translate_dir = translate_direction.clone();
     let translator_clone = translator.clone();
-    let translate_handle = std::thread::spawn(move || {
-        translator_clone.translate(&translate_text, &translate_dir)
-    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name(format!("{}-translate-worker", direction))
+        .spawn(move || {
+            let result = translator_clone.translate(&translate_text, &translate_dir);
+            let _ = tx.send(result);
+        });
 
-    let translated = match translate_handle.join() {
+    let translated = match rx.recv_timeout(Duration::from_secs(TRANSLATE_TIMEOUT_SECS)) {
         Ok(Ok(t)) => {
             let ms = translate_start.elapsed().as_millis() as u64;
             tracelog::trace(direction, "TRANSLATE", &format!("OK {}ms result='{}'", ms, t));
@@ -836,34 +855,32 @@ fn process_utterance(
             let ms = translate_start.elapsed().as_millis() as u64;
             error!("[{}] Translation error: {:#}", direction, e);
             tracelog::trace(direction, "ERROR", &format!("TRANSLATION_FAILED {}ms: {}", ms, e));
-            let _ = event_tx.try_send(Event::Error {
-                message: format!("[{}] Translation failed: {:#}", direction, e),
+            let _ = event_tx.try_send(Event::Translation {
+                direction: direction.to_string(),
+                text: format!("ERROR: {}", e),
+                translate_ms: ms,
             });
             return 0;
         }
-        Err(_panic) => {
+        Err(_timeout) => {
             let ms = translate_start.elapsed().as_millis() as u64;
-            error!("[{}] Translation thread panicked", direction);
-            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_PANIC {}ms", ms));
+            error!("[{}] Translation timed out after {}ms (limit {}s)", direction, ms, TRANSLATE_TIMEOUT_SECS);
+            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_TIMEOUT {}ms — skipping", ms));
+            let _ = event_tx.try_send(Event::Translation {
+                direction: direction.to_string(),
+                text: format!("TIMEOUT after {}ms", ms),
+                translate_ms: ms,
+            });
             return 0;
         }
     };
-
-    // Hard timeout check: if translation took more than 12 seconds, skip it
-    let translate_elapsed = translate_start.elapsed().as_millis() as u64;
-    if translate_elapsed > 12000 {
-        tracelog::trace(direction, "ERROR", &format!("TRANSLATION_TIMEOUT {}ms — skipping", translate_elapsed));
-        let _ = event_tx.try_send(Event::Error {
-            message: format!("[{}] Translation timed out after {}ms", direction, translate_elapsed),
-        });
-        return 0;
-    }
 
     let translate_ms = translate_start.elapsed().as_millis() as u64;
 
     let _ = event_tx.try_send(Event::Translation {
         direction: direction.to_string(),
         text: translated.clone(),
+        translate_ms,
     });
     tracelog::trace(direction, "EVENT", &format!("→ Elixir: translation '{}'", translated));
 
@@ -920,7 +937,23 @@ fn process_utterance(
         });
         tracelog::trace(direction, "EVENT", "→ Elixir: tts_audio sent");
 
-        if let Err(e) = playback_tx.try_send(audio) {
+        // TTS generates mono audio. If playback device is stereo (2ch),
+        // duplicate each sample so the ring buffer has the right frame count.
+        // Without this, stereo devices play mono at 2x speed.
+        let playback_channels = playback_channels;
+        let stereo_audio = if playback_channels > 1 {
+            let mut expanded = Vec::with_capacity(audio.len() * playback_channels as usize);
+            for &s in &audio {
+                for _ in 0..playback_channels {
+                    expanded.push(s);
+                }
+            }
+            expanded
+        } else {
+            audio
+        };
+
+        if let Err(e) = playback_tx.try_send(stereo_audio) {
             warn!("[{}] Playback channel full or disconnected: {}", direction, e);
             tracelog::trace(direction, "PLAYBACK", &format!("CHANNEL_FULL: {}", e));
         } else {
@@ -930,7 +963,12 @@ fn process_utterance(
         tracelog::trace(direction, "PLAYBACK", "no audio to play (TTS disabled or empty)");
     }
 
-    let _ = event_tx.try_send(Event::Metrics { stt_ms, translate_ms, tts_ms });
+    let _ = event_tx.try_send(Event::Metrics {
+        direction: direction.to_string(),
+        stt_ms,
+        translate_ms,
+        tts_ms,
+    });
     tracelog::trace(direction, "METRICS", &format!("stt={}ms translate={}ms tts={}ms total={}ms",
         stt_ms, translate_ms, tts_ms, stt_ms + translate_ms + tts_ms));
 

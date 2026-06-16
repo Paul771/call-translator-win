@@ -396,10 +396,10 @@ defp open_port do
   end
 
   defp dispatch_event(
-         %{"event" => "transcript", "direction" => direction, "text" => text} = event,
+         %{"event" => "transcript", "direction" => direction, "text" => text, "stt_ms" => stt_ms} = event,
          state
        ) do
-    line = "🎤 [#{direction}] #{text}"
+    line = "[STT] [#{direction}] #{text} (#{stt_ms}ms)"
     Logger.info(line)
     log_to_file(line)
     notify_pipeline(direction, event)
@@ -407,24 +407,25 @@ defp open_port do
   end
 
   defp dispatch_event(
-         %{"event" => "translation", "direction" => direction, "text" => text} = event,
+         %{"event" => "translation", "direction" => direction, "text" => text, "translate_ms" => translate_ms} = event,
          state
        ) do
-    line = "🌐 [#{direction}] #{text}"
+    line = if String.starts_with?(text, "ERROR:") or String.starts_with?(text, "TIMEOUT:") do
+      "[TR] [#{direction}] ✗ #{text} (#{translate_ms}ms)"
+    else
+      "[TR] [#{direction}] #{text} (#{translate_ms}ms)"
+    end
     Logger.info(line)
     log_to_file(line)
     notify_pipeline(direction, event)
     state
   end
 
-  defp dispatch_event(%{"event" => "metrics"} = event, state) do
-    metrics = Map.delete(event, "event")
-    stt = Map.get(metrics, "stt_ms", 0)
-    trl = Map.get(metrics, "translate_ms", 0)
-    tts = Map.get(metrics, "tts_ms", 0)
-    line = "⏱  stt=#{stt}ms trl=#{trl}ms tts=#{tts}ms"
+  defp dispatch_event(%{"event" => "metrics", "direction" => direction, "stt_ms" => stt, "translate_ms" => trl, "tts_ms" => tts} = event, state) do
+    total = stt + trl + tts
+    line = "[TOTAL] [#{direction}] stt=#{stt}ms trl=#{trl}ms tts=#{tts}ms total=#{total}ms"
     Logger.info(line)
-    log_to_file(line <> "\n")
+    log_to_file(line)
     state
   end
 

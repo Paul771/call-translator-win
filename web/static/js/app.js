@@ -212,7 +212,36 @@ function flushPending() {
 }
 
 function processLine(line) {
-  let m = line.match(/\uD83C\uDFA4 \[(outgoing|incoming)\] (.+)/);
+  // Try new format: [STT] [direction] text (Xms)
+  let m = line.match(/\[STT\]\s+\[(outgoing|incoming)\]\s+(.+?)\s+\((\d+)ms\)/);
+  if (m) { flushPending(); pending.direction = m[1]; pending.transcript = m[2]; pending.sttMs = parseInt(m[3]); showTyping(); return; }
+  // Try new format: [TR] [direction] text (Xms)
+  m = line.match(/\[TR\]\s+\[(outgoing|incoming)\]\s+(.+?)\s+\((\d+)ms\)/);
+  if (m) { pending.direction = m[1]; pending.translation = m[2]; pending.trlMs = parseInt(m[3]); flushPending(); return; }
+  // Try new format: [TR] [direction] ✗ text (Xms) — translation error
+  m = line.match(/\[TR\]\s+\[(outgoing|incoming)\]\s+\S+\s+(.+?)\s+\((\d+)ms\)/);
+  if (m) { pending.direction = m[1]; pending.translation = m[2]; pending.trlMs = parseInt(m[3]); flushPending(); return; }
+  // Try new format: [TOTAL] [direction] stt=Xms trl=Xms tts=Xms total=Xms
+  m = line.match(/\[TOTAL\]\s+\[(outgoing|incoming)\]\s+stt=(\d+)ms\s+trl=(\d+)ms\s+tts=(\d+)ms\s+total=(\d+)ms/);
+  if (m) {
+    const stt = parseInt(m[2]), trl = parseInt(m[3]), tts = parseInt(m[4]);
+    const total = parseInt(m[5]);
+    stats.stt.push(stt); stats.trl.push(trl); stats.tts.push(tts); stats.lat.push(total);
+    updateStats();
+    if (lastMsgEl) {
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.innerHTML = '<span class="' + latencyClass(stt) + '">stt ' + stt + 'ms</span>' +
+        '<span class="' + latencyClass(trl) + '">trl ' + trl + 'ms</span>' +
+        '<span class="' + latencyClass(tts) + '">tts ' + tts + 'ms</span>' +
+        '<span class="' + latencyClass(total) + '">= ' + total + 'ms</span>';
+      lastMsgEl.appendChild(meta);
+      scrollBottom();
+    }
+    return;
+  }
+  // Legacy emoji format fallback
+  m = line.match(/\uD83C\uDFA4 \[(outgoing|incoming)\] (.+)/);
   if (m) { flushPending(); pending.direction = m[1]; pending.transcript = m[2]; showTyping(); return; }
   m = line.match(/\uD83C\uDF10 \[(outgoing|incoming)\] (.+)/);
   if (m) { pending.direction = m[1]; pending.translation = m[2]; flushPending(); return; }
