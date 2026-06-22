@@ -64,5 +64,11 @@ pub fn list_devices() -> Result<(Vec<String>, Vec<String>)> {
         let _ = writeln!(f, "[{}] AUDIO DEVICES:\n{}", secs, msg);
     }
 
+    // Release COM resources to avoid conflicts with pipeline threads
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows::Win32::System::Com::CoUninitialize();
+    }
+
     Ok((input_names, output_names))
 }

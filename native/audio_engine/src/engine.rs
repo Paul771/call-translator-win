@@ -160,11 +160,8 @@ impl Engine {
                     }];
                 }
 
-                if let Err(e) = audio::list_devices() {
-                    info!("Could not enumerate audio devices: {:#}", e);
-                }
-
-// Skip DEEPGRAM_API_KEY check for now - it's passed via environment
+                // Note: list_devices() removed here — it holds WASAPI COM references
+                // that conflict with AudioCapture::new() on the pipeline threads.
 
                 match self.start_pipelines(&pipelines) {
                     Ok(()) => {
@@ -520,11 +517,13 @@ fn run_pipeline(
 
     let (audio_tx, audio_rx) = bounded::<AudioChunk>(512);
     let (playback_tx, playback_rx) = bounded::<Vec<f32>>(64);
-    // Transcripts go here; the processor thread picks them up without blocking audio.
-    // Increased from 16 to 64 to handle Yandex API latency (~1.2s per translation)
     let (proc_tx, proc_rx) = bounded::<(String, u64)>(64);
 
     let capture_rate: u32;
+    // Keep capture alive for the duration of the pipeline loop
+    #[allow(unused_assignments)]
+    let mut _capture_handle: Option<AudioCapture> = None;
+
     if use_loopback {
         // WASAPI loopback: capture audio playing through the output device (e.g., Jabra speakers)
         // This captures the meeting app's output without the echo of our outgoing TTS
@@ -554,13 +553,15 @@ fn run_pipeline(
             })
             .context("Failed to spawn loopback bridge thread")?;
     } else {
+        // Small delay to allow previous WASAPI sessions to fully release
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let capture = AudioCapture::new(capture_device, audio_tx)
             .with_context(|| format!("[{}] Failed to create AudioCapture", direction))?;
         capture_rate = capture.sample_rate();
         capture
             .start()
             .with_context(|| format!("[{}] Failed to start capture", direction))?;
-        std::mem::forget(capture);
+        _capture_handle = Some(capture);
     }
 
     let playback = AudioPlayback::new(playback_device, sample_rate, playback_rx)

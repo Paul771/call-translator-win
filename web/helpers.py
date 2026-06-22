@@ -172,18 +172,6 @@ def _list_audio_devices_windows():
     output_devices = []
 
     try:
-        # Initialize COM for this thread (required by pycaw/WASAPI)
-        import ctypes as _ctypes
-        _ole32 = _ctypes.windll.ole32
-        _hr = _ole32.CoInitializeEx(None, 0)  # COINIT_APARTMENTTHREADED
-        if _hr < 0 and _hr != -2147417850:  # RPC_E_CHANGED_MODE is OK
-            _logger.warning(f"CoInitializeEx failed: hr={_hr:#x}")
-        else:
-            _logger.debug(f"CoInitializeEx OK: hr={_hr:#x}")
-    except Exception as _com_err:
-        _logger.warning(f"CoInitializeEx error: {_com_err}")
-
-    try:
         # eCapture = 1 (microphones), eRender = 0 (speakers/headphones)
         for data_flow, label in [
             (EDataFlow.eCapture.value, "input"),
@@ -220,6 +208,13 @@ def _list_audio_devices_windows():
 
     except Exception as e:
         _logger.error(f"WASAPI enumeration failed: {e}", exc_info=True)
+
+    try:
+        import ctypes as _ctypes
+        _ole32 = _ctypes.windll.ole32
+        _ole32.CoUninitialize()
+    except Exception:
+        pass
 
     return {"input": input_devices, "output": output_devices}
 
