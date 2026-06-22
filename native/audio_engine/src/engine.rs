@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Sender};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::audio;
 use crate::audio::capture::{AudioCapture, AudioChunk};
@@ -372,6 +372,7 @@ impl Engine {
                 self.mute_outgoing.clone(),
                 outgoing_suppress.clone(),   // checked by outgoing
                 incoming_suppress.clone(),   // set by outgoing (suppresses incoming)
+                false,                       // no loopback for outgoing (captures from mic)
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -386,8 +387,8 @@ impl Engine {
             );
             let handle = spawn_pipeline(
                 "incoming",
-                self.config.meet_input_device.clone(),   // CABLE Output (browser speaker)
-                self.config.speaker_device.clone(),       // Jabra speakers (user hears)
+                self.config.meet_input_device.clone(),   // CABLE Output (captures remote audio from meeting app)
+                self.config.speaker_device.clone(),       // Jabra speakers (user hears TTS)
                 self.config.sample_rate,
                 stt,
                 translator.clone(),
@@ -400,6 +401,7 @@ impl Engine {
                 self.mute_incoming.clone(),
                 incoming_suppress.clone(),   // checked by incoming
                 outgoing_suppress.clone(),   // set by incoming (suppresses outgoing)
+                false,                       // regular capture from CABLE Output
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -447,6 +449,7 @@ fn spawn_pipeline(
     mute_flag: Arc<AtomicBool>,
     my_suppress: Arc<AtomicBool>,   // checked by this pipeline (set by other)
     set_other_suppress: Arc<AtomicBool>,  // set by this pipeline (checked by other)
+    use_loopback: bool,
 ) -> Result<thread::JoinHandle<()>> {
     let dir_name = direction.to_string();
     let src_lang = source_lang.to_string();
@@ -469,10 +472,11 @@ fn spawn_pipeline(
                 &tts_cfg,
                 &tts_mod,
                 &event_tx,
-                &stop_flag,
+                stop_flag,
                 &mute_flag,
                 my_suppress,
                 proc_set_other,
+                use_loopback,
             ) {
                 error!("{} pipeline failed: {:#}", dir_name, e);
                 let _ = event_tx.try_send(Event::Error {
@@ -503,14 +507,15 @@ fn run_pipeline(
     tts_config: &str,
     tts_model: &str,
     event_tx: &Sender<Event>,
-    stop_flag: &AtomicBool,
+    stop_flag: Arc<AtomicBool>,
     mute_flag: &AtomicBool,
     my_suppress: Arc<AtomicBool>,       // checked by this pipeline (set by other)
     set_other_suppress: Arc<AtomicBool>, // set by this pipeline (checked by other)
+    use_loopback: bool,
 ) -> Result<()> {
     info!(
-        "[{}] Starting pipeline: capture='{}', playback='{}'",
-        direction, capture_device, playback_device
+        "[{}] Starting pipeline: capture='{}', playback='{}', loopback={}",
+        direction, capture_device, playback_device, use_loopback
     );
 
     let (audio_tx, audio_rx) = bounded::<AudioChunk>(512);
@@ -519,9 +524,44 @@ fn run_pipeline(
     // Increased from 16 to 64 to handle Yandex API latency (~1.2s per translation)
     let (proc_tx, proc_rx) = bounded::<(String, u64)>(64);
 
-    let capture = AudioCapture::new(capture_device, audio_tx)
-        .with_context(|| format!("[{}] Failed to create AudioCapture", direction))?;
-    let capture_rate = capture.sample_rate();
+    let capture_rate: u32;
+    if use_loopback {
+        // WASAPI loopback: capture audio playing through the output device (e.g., Jabra speakers)
+        // This captures the meeting app's output without the echo of our outgoing TTS
+        info!("[{}] Using WASAPI loopback capture from '{}'", direction, capture_device);
+        tracelog::trace(direction, "DEVICE", &format!("WASAPI loopback capture from output device '{}'", capture_device));
+
+        let (std_tx, std_rx) = std::sync::mpsc::channel();
+        let loopback_stop = stop_flag.clone();
+        let loopback = crate::audio::loopback::LoopbackCapture::new(capture_device, std_tx, loopback_stop)
+            .with_context(|| format!("[{}] Failed to create WASAPI loopback capture", direction))?;
+        capture_rate = loopback.sample_rate();
+        loopback.start()
+            .with_context(|| format!("[{}] Failed to start WASAPI loopback capture", direction))?;
+        std::mem::forget(loopback);
+
+        // Bridge std::mpsc → crossbeam channel in a background thread
+        let audio_tx_clone = audio_tx;
+        std::thread::Builder::new()
+            .name(format!("loopback-bridge-{}", direction))
+            .spawn(move || {
+                while let Ok(chunk) = std_rx.recv() {
+                    if audio_tx_clone.try_send(chunk).is_err() {
+                        debug!("[loopback-bridge] Crossbeam channel full, dropping chunk");
+                    }
+                }
+                info!("[loopback-bridge] std::mpsc channel closed, bridge exiting");
+            })
+            .context("Failed to spawn loopback bridge thread")?;
+    } else {
+        let capture = AudioCapture::new(capture_device, audio_tx)
+            .with_context(|| format!("[{}] Failed to create AudioCapture", direction))?;
+        capture_rate = capture.sample_rate();
+        capture
+            .start()
+            .with_context(|| format!("[{}] Failed to start capture", direction))?;
+        std::mem::forget(capture);
+    }
 
     let playback = AudioPlayback::new(playback_device, sample_rate, playback_rx)
         .with_context(|| format!("[{}] Failed to create AudioPlayback", direction))?;
@@ -541,9 +581,6 @@ fn run_pipeline(
         .create_session(stt_sample_rate)
         .with_context(|| format!("[{}] Failed to connect to Deepgram", direction))?;
 
-    capture
-        .start()
-        .with_context(|| format!("[{}] Failed to start capture", direction))?;
     playback
         .start()
         .with_context(|| format!("[{}] Failed to start playback", direction))?;
@@ -624,28 +661,24 @@ fn run_pipeline(
                     });
                     let _ = tts_ready_tx.send(None);
                 }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let ms = translate_start.elapsed().as_millis() as u64;
-            error!("[{}] Translation thread crashed after {}ms", direction, ms);
-            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_CRASHED {}ms", ms));
-            let _ = event_tx.try_send(Event::Translation {
-                direction: direction.to_string(),
-                text: "ERROR: translator crashed".to_string(),
-                translate_ms: ms,
-            });
-            return 0;
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            let ms = translate_start.elapsed().as_millis() as u64;
-            error!("[{}] Translation timed out after {}ms (limit {}s)", direction, ms, TRANSLATE_TIMEOUT_SECS);
-            tracelog::trace(direction, "ERROR", &format!("TRANSLATION_TIMEOUT {}ms — skipping", ms));
-            let _ = event_tx.try_send(Event::Translation {
-                direction: direction.to_string(),
-                text: format!("TIMEOUT after {}ms", ms),
-                translate_ms: ms,
-            });
-            return 0;
-        }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    tracelog::trace(&proc_direction_bg, "ERROR", "TTS preload thread crashed");
+                    let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
+                        direction: proc_direction_bg.clone(),
+                        status: "fail".into(),
+                        message: "TTS preload thread crashed".into(),
+                    });
+                    let _ = tts_ready_tx.send(None);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    tracelog::trace(&proc_direction_bg, "ERROR", &format!("TTS preload timed out after {}s — continuing without TTS", TTS_PRELOAD_TIMEOUT_SECS));
+                    let _ = proc_event_tx_bg.try_send(Event::TtsStatus {
+                        direction: proc_direction_bg.clone(),
+                        status: "fail".into(),
+                        message: format!("TTS preload timed out after {}s", TTS_PRELOAD_TIMEOUT_SECS),
+                    });
+                    let _ = tts_ready_tx.send(None);
+                }
             }
         });
 
@@ -654,7 +687,7 @@ fn run_pipeline(
     let _proc_echo = set_other_suppress.clone();
     let _proc_handle = std::thread::spawn(move || {
         while let Ok((text, stt_ms)) = proc_rx.recv() {
-            tracelog::trace(&proc_direction, "STT", &format!("PROCESSOR_RECEIVED stt={}ms text='{}'", stt_ms, text));
+            tracelog::trace(&proc_direction, "PROCESSOR", &format!("RECEIVED '{}' stt={}ms (suppress={})", text, stt_ms, _proc_echo.load(Ordering::SeqCst)));
 
             // Check if TTS has finished loading (non-blocking).
             if let Ok(Some(engine)) = tts_ready_rx.try_recv() {
@@ -685,12 +718,14 @@ fn run_pipeline(
             //   incoming checks incoming_suppress (set by outgoing TTS → CABLE Input)
             if _audio_len > 0 {
                 _proc_echo.store(true, Ordering::SeqCst);
+                tracelog::trace(&proc_direction, "ECHO_SUPPRESS", &format!("SET true — {}ms TTS audio, suppressing other pipeline for {}ms", _audio_len, ((_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 2000)));
                 let es = _proc_echo.clone();
                 // Suppress for 2 seconds after TTS finishes to prevent echo pickup
                 let dur_ms = (_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 2000;
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(dur_ms));
                     es.store(false, Ordering::SeqCst);
+                    // Note: can't tracelog here because direction is moved
                 });
             }
         }
@@ -703,6 +738,7 @@ fn run_pipeline(
     const MAX_BACKOFF_MS: u64 = 30000;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
+    let mut last_audio_sent = Instant::now();
     loop {
         if stop_flag.load(Ordering::SeqCst) {
             info!("[{}] Stop flag set, exiting", direction);
@@ -734,6 +770,7 @@ fn run_pipeline(
 
         // Send ALL available audio chunks to Deepgram
         let mut chunks_sent = 0usize;
+        let mut total_chunks_with_audio = 0usize;
         for chunk in audio_rx.try_iter().take(10) {
             if mute_flag.load(Ordering::Relaxed) {
                 continue;
@@ -747,17 +784,40 @@ fn run_pipeline(
                 continue;
             }
             let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
-            if chunks_sent < 3 {
-                let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
-                tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}", samples_16k.len(), rms));
+            let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
+            if rms > 0.01 { total_chunks_with_audio += 1; }
+            if chunks_sent < 3 || (loop_count % 500 == 0 && rms > 0.01) {
+                tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}, capture_rate={}Hz→{}Hz", samples_16k.len(), rms, capture_rate, stt_sample_rate));
             }
             if let Err(e) = session.send_audio(&samples_16k) {
                 warn!("[{}] Deepgram send error: {:#}", direction, e);
+                tracelog::trace(direction, "ERROR", &format!("Deepgram send FAILED: {}", e));
                 need_reconnect = true;
                 break;
             }
             chunks_sent += 1;
         }
+        if chunks_sent > 0 {
+            last_audio_sent = Instant::now();
+            if loop_count % 500 == 0 || (loop_count < 10) {
+                tracelog::trace(direction, "CAPTURE", &format!("batch sent: {} chunks ({} with speech), total_loop={}", chunks_sent, total_chunks_with_audio, loop_count));
+            }
+        }
+        // Send silence keepalive every ~8s when no audio was captured, to prevent
+        // Deepgram server-side idle timeout (~12s when no data arrives).
+        if chunks_sent == 0 && !need_reconnect {
+            if last_audio_sent.elapsed() >= Duration::from_secs(8) {
+                let silence_samples = (stt_sample_rate as u64 * 8 / 1000) as usize;
+                let silence: Vec<f32> = vec![0.0; silence_samples];
+                if let Err(e) = session.send_audio(&silence) {
+                    warn!("[{}] Deepgram keepalive send error: {:#}", direction, e);
+                    need_reconnect = true;
+                }
+                let _ = session.flush_pending();
+                last_audio_sent = Instant::now();
+            }
+        }
+
         // Flush any pending buffered audio (from previous WouldBlock)
         let _ = session.flush_pending();
 
@@ -772,8 +832,9 @@ fn run_pipeline(
         // Non-blocking poll — returns immediately on WouldBlock
         match session.poll_transcript() {
             Ok(Some(result)) => {
-                tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
-                if my_suppress.load(Ordering::SeqCst) {
+                let is_suppressed = my_suppress.load(Ordering::SeqCst);
+                tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}' suppressed={}", result.stt_latency_ms, result.text, is_suppressed));
+                if is_suppressed {
                     info!("[{}] Echo suppressed: '{}'", direction, result.text);
                     tracelog::trace(direction, "STT", "ECHO_SUPPRESSED — not forwarded to processor");
                 } else {
@@ -781,7 +842,7 @@ fn run_pipeline(
                         warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
                         tracelog::trace(direction, "STT", &format!("PROCESSOR_CHANNEL_FULL — dropped '{}'", result.text));
                     } else {
-                        tracelog::trace(direction, "STT", &format!("sent to processor: '{}'", result.text));
+                        tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
                     }
                 }
             }
@@ -804,7 +865,6 @@ fn run_pipeline(
     }
 
     session.close();
-    let _ = capture.stop();
     let _ = playback.stop();
     drop(playback_tx);
 
@@ -943,7 +1003,7 @@ fn process_utterance(
 
     // === PLAYBACK ===
     if !audio.is_empty() {
-        tracelog::trace(direction, "PLAYBACK", &format!("queuing {} samples for playback", audio.len()));
+        tracelog::trace(direction, "PLAYBACK", &format!("queuing {} samples ({}Hz, {}ch) to device", audio.len(), sample_rate, playback_channels));
         // Downsample to 16kHz for browser monitor (good quality, ~40KB per phrase)
         let monitor_rate = 16000u32;
         let monitor_samples = resample(&audio, sample_rate, monitor_rate);

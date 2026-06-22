@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod loopback;
 pub mod playback;
 
 use anyhow::{Context, Result};
