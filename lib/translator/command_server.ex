@@ -125,8 +125,8 @@ defmodule Translator.CommandServer do
   end
 
   defp handle_command("list_devices") do
-    Translator.AudioEngine.send_command(%{"cmd" => "list_devices"})
-    "ok:listing"
+    # Skip - WASAPI device enumeration holds COM references that block pipeline audio capture
+    Jason.encode!(%{"input" => [], "output" => []})
   end
 
   defp handle_command("poll_audio") do

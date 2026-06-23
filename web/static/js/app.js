@@ -1040,8 +1040,8 @@ async function waitForEngine() {
 
 // Boot sequence
 (async function boot() {
-  // Load settings + voices + devices in parallel
-  await Promise.all([loadSettings(), loadVoices(), loadDevices()]);
+  // Load settings + voices in parallel (devices loaded on demand in settings panel)
+  await Promise.all([loadSettings(), loadVoices()]);
   applyTooltips();
 
   // Auto-open settings if no API keys configured

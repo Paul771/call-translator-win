@@ -399,8 +399,8 @@ impl Engine {
             );
             let handle = spawn_pipeline(
                 "incoming",
-                self.config.meet_input_device.clone(),   // CABLE Output (captures remote audio via CABLE)
-                self.config.speaker_device.clone(),       // Jabra speakers (user hears TTS only)
+                self.config.meet_input_device.clone(),   // CABLE Output (captures remote audio)
+                self.config.speaker_device.clone(),       // Jabra speakers (user hears TTS)
                 self.config.sample_rate,
                 stt,
                 translator.clone(),
@@ -411,9 +411,9 @@ impl Engine {
                 self.event_tx.clone(),
                 stop_flag.clone(),
                 self.mute_incoming.clone(),
-                incoming_suppress.clone(),   // checked by incoming
-                outgoing_suppress.clone(),   // set by incoming (suppresses outgoing)
-                false,                       // CABLE Output capture (not loopback)
+                incoming_suppress.clone(),
+                outgoing_suppress.clone(),
+                false,                       // CABLE Output capture
                 self.config.stt_provider.clone(),
                 self.config.yandex_api_key.clone(),
                 self.config.yandex_folder_id.clone(),
@@ -783,13 +783,9 @@ fn run_pipeline(
                 &proc_event_tx,
             );
 
-            // Echo suppression: set the OTHER pipeline's suppress flag when we play TTS.
-            // For loopback incoming pipeline, echo suppression is NOT needed because
-            // outgoing TTS plays to CABLE Input (different device from Jabra loopback).
-            // Only suppress outgoing pipeline (it captures from mic which may pick up Jabra speakers).
+            // Echo suppression: only outgoing suppresses incoming (TTS goes to CABLE, not Jabra)
             if _audio_len > 0 && proc_direction == "outgoing" {
                 _proc_echo.store(true, Ordering::SeqCst);
-                tracelog::trace(&proc_direction, "ECHO_SUPPRESS", &format!("SET true — {}ms TTS audio, suppressing incoming pipeline for {}ms", _audio_len, ((_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 2000)));
                 let es = _proc_echo.clone();
                 let dur_ms = (_audio_len as f32 / proc_sample_rate as f32 * 1000.0) as u64 + 2000;
                 std::thread::spawn(move || {
@@ -881,14 +877,6 @@ fn run_pipeline(
             if mute_flag.load(Ordering::Relaxed) {
                 continue;
             }
-            // Echo suppression: drop audio when other pipeline plays TTS
-            if my_suppress.load(Ordering::SeqCst) {
-                if chunks_sent == 0 {
-                    tracelog::trace(direction, "CAPTURE", "ECHO_SUPPRESSED");
-                }
-                chunks_sent += 1;
-                continue;
-            }
             let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
             let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
             if rms > 0.01 { total_chunks_with_audio += 1; }
@@ -940,15 +928,11 @@ fn run_pipeline(
         // Non-blocking poll — returns immediately on WouldBlock
         match session.poll_transcript() {
             Ok(Some(result)) => {
-                if my_suppress.load(Ordering::SeqCst) {
-                    tracelog::trace(direction, "STT", &format!("ECHO_SUPPRESSED transcript='{}'", result.text));
+                tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
+                if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms)) {
+                    warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
                 } else {
-                    tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
-                    if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms)) {
-                        warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
-                    } else {
-                        tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
-                    }
+                    tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
                 }
             }
             Ok(None) => {}
