@@ -293,7 +293,8 @@ defp open_port do
             {~c"TRANSLATOR_PROVIDER", String.to_charlist(Map.get(settings, "translation_provider", "auto"))},
             {~c"LITELLM_BASE_URL", String.to_charlist(Map.get(settings, "litellm_base_url", ""))},
             {~c"LITELLM_API_KEY", String.to_charlist(Map.get(settings, "litellm_api_key", ""))},
-            {~c"LITELLM_MODEL", String.to_charlist(Map.get(settings, "litellm_model", "ollama:ministral-3:3b-cloud"))}
+            {~c"LITELLM_MODEL", String.to_charlist(Map.get(settings, "litellm_model", "ollama:ministral-3:3b-cloud"))},
+            {~c"STT_PROVIDER", String.to_charlist(Map.get(settings, "stt_provider", "auto"))}
           ]}
         ])
 

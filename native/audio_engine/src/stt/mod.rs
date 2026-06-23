@@ -1,3 +1,5 @@
+pub mod yandex_stt;
+
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
@@ -279,4 +281,43 @@ fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> R
         _ => {}
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unified STT interface — wraps Deepgram and Yandex SpeechKit
+// ---------------------------------------------------------------------------
+
+pub enum UnifiedSttSession {
+    Deepgram(DeepgramSession),
+    Yandex(yandex_stt::YandexSttSession),
+}
+
+impl UnifiedSttSession {
+    pub fn send_audio(&mut self, samples: &[f32]) -> Result<()> {
+        match self {
+            Self::Deepgram(s) => s.send_audio(samples),
+            Self::Yandex(s) => s.send_audio(samples),
+        }
+    }
+
+    pub fn flush_pending(&mut self) -> Result<()> {
+        match self {
+            Self::Deepgram(s) => s.flush_pending(),
+            Self::Yandex(_) => Ok(()),
+        }
+    }
+
+    pub fn poll_transcript(&mut self) -> Result<Option<SttResult>> {
+        match self {
+            Self::Deepgram(s) => s.poll_transcript(),
+            Self::Yandex(s) => s.poll_transcript(),
+        }
+    }
+
+    pub fn close(&mut self) {
+        match self {
+            Self::Deepgram(s) => s.close(),
+            Self::Yandex(_) => {},
+        }
+    }
 }

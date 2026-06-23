@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Sender};
 use log::{debug, error, info, warn};
 
@@ -17,7 +17,7 @@ use crate::audio;
 use crate::audio::capture::{AudioCapture, AudioChunk};
 use crate::audio::playback::AudioPlayback;
 use crate::protocol::{Command, Event};
-use crate::stt::DeepgramStt;
+use crate::stt::{DeepgramStt, UnifiedSttSession};
 use crate::tracelog;
 use crate::translation::{TranslationDirection, TranslationEngine};
 use crate::tts::TtsEngine;
@@ -35,6 +35,7 @@ pub struct EngineConfig {
     pub litellm_base_url: String,
     pub litellm_api_key: String,
     pub litellm_model: String,
+    pub stt_provider: String,
     pub tts_en_model: String,
     pub tts_en_config: String,
     pub tts_ru_model: String,
@@ -86,6 +87,7 @@ impl EngineConfig {
             litellm_base_url: std::env::var("LITELLM_BASE_URL").unwrap_or_default(),
             litellm_api_key: std::env::var("LITELLM_API_KEY").unwrap_or_default(),
             litellm_model: std::env::var("LITELLM_MODEL").unwrap_or_else(|_| "ollama:ministral-3:3b-cloud".into()),
+            stt_provider: std::env::var("STT_PROVIDER").unwrap_or_else(|_| "auto".into()),
             tts_en_model: std::env::var("TRANSLATOR_TTS_EN_MODEL")
                 .unwrap_or_else(|_| format!("{}/piper-en/en_GB-alan-low.onnx", base)),
             tts_en_config: std::env::var("TRANSLATOR_TTS_EN_CONFIG")
@@ -376,6 +378,10 @@ impl Engine {
                 outgoing_suppress.clone(),   // checked by outgoing
                 incoming_suppress.clone(),   // set by outgoing (suppresses incoming)
                 false,                       // no loopback for outgoing (captures from mic)
+                self.config.stt_provider.clone(),
+                self.config.yandex_api_key.clone(),
+                self.config.yandex_folder_id.clone(),
+                self.config.my_language.clone(),
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -405,6 +411,10 @@ impl Engine {
                 incoming_suppress.clone(),   // checked by incoming
                 outgoing_suppress.clone(),   // set by incoming (suppresses outgoing)
                 false,                       // regular capture from CABLE Output
+                self.config.stt_provider.clone(),
+                self.config.yandex_api_key.clone(),
+                self.config.yandex_folder_id.clone(),
+                self.config.their_language.clone(),
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -453,6 +463,10 @@ fn spawn_pipeline(
     my_suppress: Arc<AtomicBool>,   // checked by this pipeline (set by other)
     set_other_suppress: Arc<AtomicBool>,  // set by this pipeline (checked by other)
     use_loopback: bool,
+    stt_provider: String,
+    yandex_key: String,
+    yandex_folder_id: String,
+    stt_language: String,
 ) -> Result<thread::JoinHandle<()>> {
     let dir_name = direction.to_string();
     let src_lang = source_lang.to_string();
@@ -475,11 +489,15 @@ fn spawn_pipeline(
                 &tts_cfg,
                 &tts_mod,
                 &event_tx,
-                stop_flag,
+                stop_flag.clone(),
                 &mute_flag,
                 my_suppress,
                 proc_set_other,
                 use_loopback,
+                &stt_provider,
+                &yandex_key,
+                &yandex_folder_id,
+                &stt_language,
             ) {
                 error!("{} pipeline failed: {:#}", dir_name, e);
                 let _ = event_tx.try_send(Event::Error {
@@ -515,6 +533,10 @@ fn run_pipeline(
     my_suppress: Arc<AtomicBool>,       // checked by this pipeline (set by other)
     set_other_suppress: Arc<AtomicBool>, // set by this pipeline (checked by other)
     use_loopback: bool,
+    stt_provider: &str,
+    yandex_key: &str,
+    yandex_folder_id: &str,
+    stt_language: &str,
 ) -> Result<()> {
     info!(
         "[{}] Starting pipeline: capture='{}', playback='{}', loopback={}",
@@ -584,9 +606,33 @@ fn run_pipeline(
 
     // Connect to Deepgram — stream at 16kHz to save bandwidth
     let stt_sample_rate = 16_000_u32;
-    let mut session = stt
-        .create_session(stt_sample_rate)
-        .with_context(|| format!("[{}] Failed to connect to Deepgram", direction))?;
+
+    // Create STT session based on provider config
+    let mut session = if stt_provider == "yandex" && !yandex_key.is_empty() {
+        info!("[{}] Using Yandex SpeechKit STT", direction);
+        UnifiedSttSession::Yandex(crate::stt::yandex_stt::YandexSttSession::new(
+            &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+        )?)
+    } else if stt_provider == "deepgram" || stt_provider == "auto" {
+        // Try Deepgram first
+        match stt.create_session(stt_sample_rate) {
+            Ok(s) => {
+                info!("[{}] Using Deepgram STT", direction);
+                UnifiedSttSession::Deepgram(s)
+            }
+            Err(e) if stt_provider == "auto" && !yandex_key.is_empty() => {
+                warn!("[{}] Deepgram failed ({}), falling back to Yandex STT", direction, e);
+                UnifiedSttSession::Yandex(crate::stt::yandex_stt::YandexSttSession::new(
+                    &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                )?)
+            }
+            Err(e) => {
+                bail!("[{}] Failed to create STT session: {:#}", direction, e);
+            }
+        }
+    } else {
+        bail!("[{}] No valid STT provider configured (provider='{}')", direction, stt_provider);
+    };
 
     playback
         .start()
@@ -758,19 +804,39 @@ fn run_pipeline(
                 2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
                 MAX_BACKOFF_MS,
             );
-            info!("[{}] Reconnecting to Deepgram (attempt #{}, {}ms backoff, keep retrying)...", direction, reconnect_attempts, backoff_ms);
+            info!("[{}] Reconnecting STT (attempt #{}, {}ms backoff)...", direction, reconnect_attempts, backoff_ms);
             session.close();
             std::thread::sleep(Duration::from_millis(backoff_ms));
+
+            // In auto mode, try Deepgram first, then fall back to Yandex
             match stt.create_session(stt_sample_rate) {
                 Ok(new_session) => {
-                    session = new_session;
+                    session = UnifiedSttSession::Deepgram(new_session);
                     need_reconnect = false;
                     reconnect_attempts = 0;
                     info!("[{}] Deepgram reconnected", direction);
                 }
                 Err(e) => {
-                    error!("[{}] Deepgram reconnect failed: {:#}", direction, e);
-                    continue;
+                    if stt_provider == "auto" && !yandex_key.is_empty() {
+                        warn!("[{}] Deepgram reconnect failed ({}), switching to Yandex", direction, e);
+                        match crate::stt::yandex_stt::YandexSttSession::new(
+                            &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                        ) {
+                            Ok(ys) => {
+                                session = UnifiedSttSession::Yandex(ys);
+                                need_reconnect = false;
+                                reconnect_attempts = 0;
+                                info!("[{}] Switched to Yandex STT", direction);
+                            }
+                            Err(e2) => {
+                                error!("[{}] Yandex STT init also failed: {:#}", direction, e2);
+                                continue;
+                            }
+                        }
+                    } else {
+                        error!("[{}] Deepgram reconnect failed: {:#}", direction, e);
+                        continue;
+                    }
                 }
             }
         }

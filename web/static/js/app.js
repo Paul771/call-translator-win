@@ -544,6 +544,7 @@ function populateForm(s) {
   document.getElementById('cfg-endpointing').value = s.endpointing_ms || 300;
   document.getElementById('endpointing-val').textContent = (s.endpointing_ms || 300) + 'ms';
   document.getElementById('cfg-translation-provider').value = s.translation_provider || 'auto';
+  document.getElementById('cfg-stt-provider').value = s.stt_provider || 'auto';
   document.getElementById('cfg-litellm-url').value = s.litellm_base_url || '';
   document.getElementById('cfg-litellm-model').value = s.litellm_model || 'ollama:ministral-3:3b-cloud';
   const lk = document.getElementById('cfg-litellm-key');
@@ -562,6 +563,7 @@ function readForm() {
     litellm_base_url: document.getElementById('cfg-litellm-url').value.trim(),
     litellm_api_key: (document.getElementById('cfg-litellm-key')._getRealValue || (() => document.getElementById('cfg-litellm-key').value))().trim(),
     litellm_model: document.getElementById('cfg-litellm-model').value.trim(),
+    stt_provider: document.getElementById('cfg-stt-provider').value,
     my_language: document.getElementById('cfg-my-lang').value,
     their_language: document.getElementById('cfg-their-lang').value,
     tts_outgoing_voice: document.getElementById('cfg-voice-out').value,
