@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::tracelog;
@@ -23,8 +23,13 @@ impl YandexSttSession {
             .build()
             .context("Failed to build HTTP client for Yandex STT")?;
 
+        // Get IAM token from API key (required for Yandex STT)
+        let iam_token = Self::get_iam_token(&client, api_key)
+            .context("Failed to get IAM token for Yandex STT")?;
+        tracelog::trace("stt", "STT", &format!("Yandex STT IAM token obtained, len={}", iam_token.len()));
+
         Ok(Self {
-            api_key: api_key.to_string(),
+            api_key: iam_token,
             folder_id: folder_id.to_string(),
             language: language.to_string(),
             client,
@@ -32,6 +37,29 @@ impl YandexSttSession {
             last_send: std::time::Instant::now(),
             sample_rate,
         })
+    }
+
+    fn get_iam_token(client: &reqwest::blocking::Client, api_key: &str) -> Result<String> {
+        let url = "https://iam.api.cloud.yandex.net/iam/v1/tokens";
+        let body = serde_json::json!({
+            "yandexPassportOauthToken": api_key
+        });
+
+        let response = client.post(url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .context("Failed to request IAM token")?;
+
+        if response.status().is_success() {
+            let resp: IamTokenResponse = response.json()
+                .context("Failed to parse IAM token response")?;
+            Ok(resp.iam_token)
+        } else {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            bail!("Yandex IAM token error {}: {}", status, text)
+        }
     }
 
     pub fn send_audio(&mut self, samples: &[f32]) -> Result<()> {
@@ -117,4 +145,9 @@ impl YandexSttSession {
 #[derive(Deserialize)]
 struct YandexSttResponse {
     result: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IamTokenResponse {
+    iam_token: String,
 }
