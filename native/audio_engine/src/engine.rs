@@ -788,6 +788,8 @@ fn run_pipeline(
 
     let mut need_reconnect = false;
     let mut reconnect_attempts: u32 = 0;
+    let mut deepgram_fail_count: u32 = 0;
+    const MAX_DEEPGRAM_FAILS: u32 = 3;
     const MAX_BACKOFF_MS: u64 = 30000;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
@@ -808,33 +810,60 @@ fn run_pipeline(
             session.close();
             std::thread::sleep(Duration::from_millis(backoff_ms));
 
-            // In auto mode, try Deepgram first, then fall back to Yandex
-            match stt.create_session(stt_sample_rate) {
-                Ok(new_session) => {
-                    session = UnifiedSttSession::Deepgram(new_session);
-                    need_reconnect = false;
-                    reconnect_attempts = 0;
-                    info!("[{}] Deepgram reconnected", direction);
+            // In auto mode, try Deepgram first. If it fails repeatedly, switch to Yandex.
+            if matches!(session, UnifiedSttSession::Deepgram(_)) || stt_provider == "deepgram" {
+                match stt.create_session(stt_sample_rate) {
+                    Ok(new_session) => {
+                        session = UnifiedSttSession::Deepgram(new_session);
+                        need_reconnect = false;
+                        reconnect_attempts = 0;
+                        deepgram_fail_count = 0;
+                        info!("[{}] Deepgram reconnected", direction);
+                    }
+                    Err(e) => {
+                        deepgram_fail_count += 1;
+                        warn!("[{}] Deepgram reconnect failed ({}/{}): {:#}", direction, deepgram_fail_count, MAX_DEEPGRAM_FAILS, e);
+                        if deepgram_fail_count >= MAX_DEEPGRAM_FAILS && stt_provider == "auto" && !yandex_key.is_empty() {
+                            warn!("[{}] Switching to Yandex STT after {} Deepgram failures", direction, deepgram_fail_count);
+                            match crate::stt::yandex_stt::YandexSttSession::new(
+                                &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                            ) {
+                                Ok(ys) => {
+                                    session = UnifiedSttSession::Yandex(ys);
+                                    need_reconnect = false;
+                                    reconnect_attempts = 0;
+                                    info!("[{}] Switched to Yandex STT ✓", direction);
+                                }
+                                Err(e2) => {
+                                    error!("[{}] Yandex STT init also failed: {:#}", direction, e2);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
                 }
-                Err(e) => {
-                    if stt_provider == "auto" && !yandex_key.is_empty() {
-                        warn!("[{}] Deepgram reconnect failed ({}), switching to Yandex", direction, e);
-                        match crate::stt::yandex_stt::YandexSttSession::new(
+            } else if matches!(session, UnifiedSttSession::Yandex(_)) {
+                // Yandex failed, try reconnecting to Deepgram
+                match stt.create_session(stt_sample_rate) {
+                    Ok(new_session) => {
+                        session = UnifiedSttSession::Deepgram(new_session);
+                        need_reconnect = false;
+                        reconnect_attempts = 0;
+                        deepgram_fail_count = 0;
+                        info!("[{}] Switched back to Deepgram STT ✓", direction);
+                    }
+                    Err(e) => {
+                        warn!("[{}] Deepgram also unavailable: {:#}, staying on Yandex", direction, e);
+                        // Re-init Yandex as fallback
+                        if let Ok(ys) = crate::stt::yandex_stt::YandexSttSession::new(
                             &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
                         ) {
-                            Ok(ys) => {
-                                session = UnifiedSttSession::Yandex(ys);
-                                need_reconnect = false;
-                                reconnect_attempts = 0;
-                                info!("[{}] Switched to Yandex STT", direction);
-                            }
-                            Err(e2) => {
-                                error!("[{}] Yandex STT init also failed: {:#}", direction, e2);
-                                continue;
-                            }
+                            session = UnifiedSttSession::Yandex(ys);
+                            need_reconnect = false;
+                            reconnect_attempts = 0;
                         }
-                    } else {
-                        error!("[{}] Deepgram reconnect failed: {:#}", direction, e);
                         continue;
                     }
                 }
@@ -863,8 +892,9 @@ fn run_pipeline(
                 tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}, capture_rate={}Hz→{}Hz", samples_16k.len(), rms, capture_rate, stt_sample_rate));
             }
             if let Err(e) = session.send_audio(&samples_16k) {
-                warn!("[{}] Deepgram send error: {:#}", direction, e);
-                tracelog::trace(direction, "ERROR", &format!("Deepgram send FAILED: {}", e));
+                warn!("[{}] STT send error: {:#}", direction, e);
+                tracelog::trace(direction, "ERROR", &format!("STT send FAILED: {}", e));
+                deepgram_fail_count += 1;
                 need_reconnect = true;
                 break;
             }
@@ -883,7 +913,8 @@ fn run_pipeline(
                 let silence_samples = (stt_sample_rate as u64 * 8 / 1000) as usize;
                 let silence: Vec<f32> = vec![0.0; silence_samples];
                 if let Err(e) = session.send_audio(&silence) {
-                    warn!("[{}] Deepgram keepalive send error: {:#}", direction, e);
+                    warn!("[{}] STT keepalive send error: {:#}", direction, e);
+                    deepgram_fail_count += 1;
                     need_reconnect = true;
                 }
                 let _ = session.flush_pending();
@@ -921,11 +952,12 @@ fn run_pipeline(
             }
             Ok(None) => {}
             Err(e) => {
-                error!("[{}] Deepgram error: {:#}", direction, e);
-                tracelog::trace(direction, "ERROR", &format!("Deepgram error: {}", e));
+                error!("[{}] STT error: {:#}", direction, e);
+                tracelog::trace(direction, "ERROR", &format!("STT error: {}", e));
                 let _ = event_tx.try_send(Event::Error {
-                    message: format!("[{}] Deepgram error: {:#}", direction, e),
+                    message: format!("[{}] STT error: {:#}", direction, e),
                 });
+                deepgram_fail_count += 1;
                 need_reconnect = true;
             }
         }
