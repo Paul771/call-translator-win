@@ -1,4 +1,5 @@
 pub mod yandex_stt;
+pub mod whisper_stt;
 
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
@@ -290,6 +291,7 @@ fn set_nonblocking(ws: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>) -> R
 pub enum UnifiedSttSession {
     Deepgram(DeepgramSession),
     Yandex(yandex_stt::YandexSttSession),
+    Whisper(whisper_stt::WhisperSttSession),
 }
 
 impl UnifiedSttSession {
@@ -297,13 +299,14 @@ impl UnifiedSttSession {
         match self {
             Self::Deepgram(s) => s.send_audio(samples),
             Self::Yandex(s) => s.send_audio(samples),
+            Self::Whisper(s) => s.send_audio(samples),
         }
     }
 
     pub fn flush_pending(&mut self) -> Result<()> {
         match self {
             Self::Deepgram(s) => s.flush_pending(),
-            Self::Yandex(_) => Ok(()),
+            Self::Yandex(_) | Self::Whisper(_) => Ok(()),
         }
     }
 
@@ -311,13 +314,14 @@ impl UnifiedSttSession {
         match self {
             Self::Deepgram(s) => s.poll_transcript(),
             Self::Yandex(s) => s.poll_transcript(),
+            Self::Whisper(s) => s.poll_transcript(),
         }
     }
 
     pub fn close(&mut self) {
         match self {
             Self::Deepgram(s) => s.close(),
-            Self::Yandex(_) => {},
+            Self::Yandex(_) | Self::Whisper(_) => {},
         }
     }
 }

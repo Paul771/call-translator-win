@@ -36,6 +36,7 @@ pub struct EngineConfig {
     pub litellm_api_key: String,
     pub litellm_model: String,
     pub stt_provider: String,
+    pub whisper_model: String,
     pub tts_en_model: String,
     pub tts_en_config: String,
     pub tts_ru_model: String,
@@ -88,6 +89,7 @@ impl EngineConfig {
             litellm_api_key: std::env::var("LITELLM_API_KEY").unwrap_or_default(),
             litellm_model: std::env::var("LITELLM_MODEL").unwrap_or_else(|_| "ollama:ministral-3:3b-cloud".into()),
             stt_provider: std::env::var("STT_PROVIDER").unwrap_or_else(|_| "auto".into()),
+            whisper_model: std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "tiny".into()),
             tts_en_model: std::env::var("TRANSLATOR_TTS_EN_MODEL")
                 .unwrap_or_else(|_| format!("{}/piper-en/en_GB-alan-low.onnx", base)),
             tts_en_config: std::env::var("TRANSLATOR_TTS_EN_CONFIG")
@@ -382,6 +384,7 @@ impl Engine {
                 self.config.yandex_api_key.clone(),
                 self.config.yandex_folder_id.clone(),
                 self.config.my_language.clone(),
+                self.config.whisper_model.clone(),
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -396,7 +399,7 @@ impl Engine {
             );
             let handle = spawn_pipeline(
                 "incoming",
-                self.config.meet_input_device.clone(),   // CABLE Output (captures remote audio from meeting app)
+                self.config.speaker_device.clone(),       // WASAPI loopback from Jabra speakers (captures remote audio only)
                 self.config.speaker_device.clone(),       // Jabra speakers (user hears TTS)
                 self.config.sample_rate,
                 stt,
@@ -410,11 +413,12 @@ impl Engine {
                 self.mute_incoming.clone(),
                 incoming_suppress.clone(),   // checked by incoming
                 outgoing_suppress.clone(),   // set by incoming (suppresses outgoing)
-                false,                       // regular capture from CABLE Output
+                true,                        // WASAPI loopback from Jabra speakers
                 self.config.stt_provider.clone(),
                 self.config.yandex_api_key.clone(),
                 self.config.yandex_folder_id.clone(),
                 self.config.their_language.clone(),
+                self.config.whisper_model.clone(),
             )?;
             self.pipeline_handles.push(handle);
         }
@@ -467,6 +471,7 @@ fn spawn_pipeline(
     yandex_key: String,
     yandex_folder_id: String,
     stt_language: String,
+    whisper_model: String,
 ) -> Result<thread::JoinHandle<()>> {
     let dir_name = direction.to_string();
     let src_lang = source_lang.to_string();
@@ -498,6 +503,7 @@ fn spawn_pipeline(
                 &yandex_key,
                 &yandex_folder_id,
                 &stt_language,
+                &whisper_model,
             ) {
                 error!("{} pipeline failed: {:#}", dir_name, e);
                 let _ = event_tx.try_send(Event::Error {
@@ -537,6 +543,7 @@ fn run_pipeline(
     yandex_key: &str,
     yandex_folder_id: &str,
     stt_language: &str,
+    whisper_model: &str,
 ) -> Result<()> {
     info!(
         "[{}] Starting pipeline: capture='{}', playback='{}', loopback={}",
@@ -613,6 +620,11 @@ fn run_pipeline(
         UnifiedSttSession::Yandex(crate::stt::yandex_stt::YandexSttSession::new(
             &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
         )?)
+    } else if stt_provider == "whisper" {
+        info!("[{}] Using local Whisper STT (model={})", direction, whisper_model);
+        UnifiedSttSession::Whisper(crate::stt::whisper_stt::WhisperSttSession::new(
+            stt_sample_rate, &whisper_model,
+        )?)
     } else if stt_provider == "deepgram" || stt_provider == "auto" {
         // Try Deepgram first
         match stt.create_session(stt_sample_rate) {
@@ -624,6 +636,12 @@ fn run_pipeline(
                 warn!("[{}] Deepgram failed ({}), falling back to Yandex STT", direction, e);
                 UnifiedSttSession::Yandex(crate::stt::yandex_stt::YandexSttSession::new(
                     &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                )?)
+            }
+            Err(e) if stt_provider == "auto" => {
+                warn!("[{}] Deepgram failed ({}), falling back to local Whisper STT", direction, e);
+                UnifiedSttSession::Whisper(crate::stt::whisper_stt::WhisperSttSession::new(
+                    stt_sample_rate, &whisper_model,
                 )?)
             }
             Err(e) => {
@@ -810,17 +828,36 @@ fn run_pipeline(
             session.close();
             std::thread::sleep(Duration::from_millis(backoff_ms));
 
-            // Auto mode: after MAX_DEEPGRAM_DROPS disconnections, switch to Yandex permanently
-            if deepgram_drop_count >= MAX_DEEPGRAM_DROPS && stt_provider == "auto" && !yandex_key.is_empty() {
-                warn!("[{}] Switching to Yandex STT after {} Deepgram drops", direction, deepgram_drop_count);
-                if let Ok(ys) = crate::stt::yandex_stt::YandexSttSession::new(
-                    &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
-                ) {
-                    session = UnifiedSttSession::Yandex(ys);
-                    need_reconnect = false;
-                    reconnect_attempts = 0;
-                    info!("[{}] Switched to Yandex STT ✓", direction);
-                    continue;
+            // Auto mode: after MAX_DEEPGRAM_DROPS disconnections, switch to Yandex, then Whisper
+            if deepgram_drop_count >= MAX_DEEPGRAM_DROPS && stt_provider == "auto" {
+                if !yandex_key.is_empty() && !matches!(session, UnifiedSttSession::Yandex(_)) {
+                    warn!("[{}] Switching to Yandex STT after {} Deepgram drops", direction, deepgram_drop_count);
+                    if let Ok(ys) = crate::stt::yandex_stt::YandexSttSession::new(
+                        &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                    ) {
+                        session = UnifiedSttSession::Yandex(ys);
+                        need_reconnect = false;
+                        reconnect_attempts = 0;
+                        info!("[{}] Switched to Yandex STT ✓", direction);
+                        continue;
+                    }
+                }
+                // If Yandex failed or not available, use local Whisper
+                if !matches!(session, UnifiedSttSession::Whisper(_)) {
+                    warn!("[{}] Switching to local Whisper STT", direction);
+                    match crate::stt::whisper_stt::WhisperSttSession::new(stt_sample_rate, &whisper_model) {
+                        Ok(ws) => {
+                            session = UnifiedSttSession::Whisper(ws);
+                            need_reconnect = false;
+                            reconnect_attempts = 0;
+                            info!("[{}] Switched to local Whisper STT ✓", direction);
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("[{}] Whisper init failed: {:#}", direction, e);
+                            continue;
+                        }
+                    }
                 }
             }
 

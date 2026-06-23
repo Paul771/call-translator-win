@@ -294,7 +294,8 @@ defp open_port do
             {~c"LITELLM_BASE_URL", String.to_charlist(Map.get(settings, "litellm_base_url", ""))},
             {~c"LITELLM_API_KEY", String.to_charlist(Map.get(settings, "litellm_api_key", ""))},
             {~c"LITELLM_MODEL", String.to_charlist(Map.get(settings, "litellm_model", "ollama:ministral-3:3b-cloud"))},
-            {~c"STT_PROVIDER", String.to_charlist(Map.get(settings, "stt_provider", "auto"))}
+            {~c"STT_PROVIDER", String.to_charlist(Map.get(settings, "stt_provider", "auto"))},
+            {~c"WHISPER_MODEL", String.to_charlist(Map.get(settings, "whisper_model", "tiny"))}
           ]}
         ])
 

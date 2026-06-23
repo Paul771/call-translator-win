@@ -44,11 +44,21 @@
         <div class="sp-field">
           <div class="sp-label">STT Provider</div>
           <select class="sp-input" id="cfg-stt-provider">
-            <option value="auto">Auto (Deepgram → Yandex fallback)</option>
+            <option value="auto">Auto (Deepgram → Yandex → Whisper)</option>
             <option value="deepgram">Deepgram only</option>
             <option value="yandex">Yandex SpeechKit only</option>
+            <option value="whisper">Local Whisper only</option>
           </select>
-          <div class="sp-hint">Auto tries Deepgram first, falls back to Yandex if Deepgram fails.</div>
+          <div class="sp-hint">Auto tries Deepgram first, falls back to Yandex, then local Whisper.</div>
+        </div>
+        <div class="sp-field">
+          <div class="sp-label">Whisper Model (local)</div>
+          <select class="sp-input" id="cfg-whisper-model">
+            <option value="tiny">tiny (~75MB, fastest)</option>
+            <option value="base">base (~150MB, better quality)</option>
+            <option value="small">small (~500MB, good quality)</option>
+          </select>
+          <div class="sp-hint">Local Whisper model. Used as last fallback when Deepgram and Yandex are unavailable.</div>
         </div>
         <div class="sp-field">
           <div class="sp-label">Groq API Key <span class="badge">Translation</span></div>
