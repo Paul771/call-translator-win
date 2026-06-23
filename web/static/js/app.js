@@ -544,6 +544,11 @@ function populateForm(s) {
   document.getElementById('cfg-endpointing').value = s.endpointing_ms || 300;
   document.getElementById('endpointing-val').textContent = (s.endpointing_ms || 300) + 'ms';
   document.getElementById('cfg-translation-provider').value = s.translation_provider || 'auto';
+  document.getElementById('cfg-litellm-url').value = s.litellm_base_url || '';
+  document.getElementById('cfg-litellm-model').value = s.litellm_model || 'ollama:ministral-3:3b-cloud';
+  const lk = document.getElementById('cfg-litellm-key');
+  if (lk._setRealValue) lk._setRealValue(s.litellm_api_key || '');
+  else lk.value = s.litellm_api_key || '';
   // Device dropdowns populated by loadDevices() using currentSettings
 }
 
@@ -554,6 +559,9 @@ function readForm() {
     yandex_api_key: (document.getElementById('cfg-yandex')._getRealValue || (() => document.getElementById('cfg-yandex').value))().trim(),
     yandex_folder_id: document.getElementById('cfg-yandex-folder').value.trim(),
     translation_provider: document.getElementById('cfg-translation-provider').value,
+    litellm_base_url: document.getElementById('cfg-litellm-url').value.trim(),
+    litellm_api_key: (document.getElementById('cfg-litellm-key')._getRealValue || (() => document.getElementById('cfg-litellm-key').value))().trim(),
+    litellm_model: document.getElementById('cfg-litellm-model').value.trim(),
     my_language: document.getElementById('cfg-my-lang').value,
     their_language: document.getElementById('cfg-their-lang').value,
     tts_outgoing_voice: document.getElementById('cfg-voice-out').value,

@@ -32,6 +32,9 @@ pub struct EngineConfig {
     pub yandex_api_key: String,
     pub yandex_folder_id: String,
     pub translation_provider: String,
+    pub litellm_base_url: String,
+    pub litellm_api_key: String,
+    pub litellm_model: String,
     pub tts_en_model: String,
     pub tts_en_config: String,
     pub tts_ru_model: String,
@@ -80,6 +83,9 @@ impl EngineConfig {
             yandex_api_key: yandex_key,
             yandex_folder_id: yandex_folder_id,
             translation_provider: translation_provider,
+            litellm_base_url: std::env::var("LITELLM_BASE_URL").unwrap_or_default(),
+            litellm_api_key: std::env::var("LITELLM_API_KEY").unwrap_or_default(),
+            litellm_model: std::env::var("LITELLM_MODEL").unwrap_or_else(|_| "ollama:ministral-3:3b-cloud".into()),
             tts_en_model: std::env::var("TRANSLATOR_TTS_EN_MODEL")
                 .unwrap_or_else(|_| format!("{}/piper-en/en_GB-alan-low.onnx", base)),
             tts_en_config: std::env::var("TRANSLATOR_TTS_EN_CONFIG")
@@ -319,7 +325,7 @@ impl Engine {
 
         info!("Loading translation models...");
         let translator = Arc::new(
-            TranslationEngine::new(&self.config.groq_api_key, &self.config.yandex_api_key, &self.config.yandex_folder_id, &self.config.translation_provider)
+            TranslationEngine::new(&self.config.groq_api_key, &self.config.yandex_api_key, &self.config.yandex_folder_id, &self.config.translation_provider, &self.config.litellm_base_url, &self.config.litellm_api_key, &self.config.litellm_model)
             .context("Failed to initialize translation engine")?,
         );
 

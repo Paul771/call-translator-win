@@ -66,11 +66,33 @@
         <div class="sp-field">
           <div class="sp-label">Translation Provider</div>
           <select class="sp-input" id="cfg-translation-provider">
-            <option value="auto">Auto (try Groq, fallback to Yandex)</option>
+            <option value="auto">Auto (Groq → LiteLLM → Yandex)</option>
             <option value="groq">Groq only</option>
+            <option value="litellm">AI Portal (LiteLLM) only</option>
             <option value="yandex">Yandex only</option>
           </select>
-          <div class="sp-hint">Auto tries Groq first, falls back to Yandex if Groq fails.</div>
+          <div class="sp-hint">Auto tries Groq first, falls back to LiteLLM, then Yandex.</div>
+        </div>
+        <div class="sp-field">
+          <div class="sp-label">AI Portal (LiteLLM) Base URL <span class="badge">Translation</span></div>
+          <div class="sp-input-row">
+            <input class="sp-input" id="cfg-litellm-url" type="text" placeholder="https://ai-portal.example.com/litellm" autocomplete="one-time-code" spellcheck="false">
+          </div>
+          <div class="sp-hint">LiteLLM-compatible proxy base URL. Used as fallback for translation.</div>
+        </div>
+        <div class="sp-field">
+          <div class="sp-label">AI Portal API Key</div>
+          <div class="sp-input-row">
+            <input class="sp-input sp-key" id="cfg-litellm-key" type="text" placeholder="Enter AI Portal API key..." autocomplete="one-time-code" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other">
+          </div>
+          <div class="sp-hint">API key for the AI Portal LiteLLM proxy.</div>
+        </div>
+        <div class="sp-field">
+          <div class="sp-label">AI Portal Model</div>
+          <div class="sp-input-row">
+            <input class="sp-input" id="cfg-litellm-model" type="text" placeholder="ollama:ministral-3:3b-cloud" autocomplete="one-time-code" spellcheck="false">
+          </div>
+          <div class="sp-hint">Model to use from the AI Portal. Available: ollama:ministral-3:3b-cloud, ollama:deepseek-v4-flash:cloud, openrouter_mistralai/ministral-3b-2512, openrouter_google/gemini-3.1-flash-lite</div>
         </div>
       </div>
     </div>

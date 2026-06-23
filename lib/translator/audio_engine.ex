@@ -290,7 +290,10 @@ defp open_port do
             {~c"TRANSLATOR_ENDPOINTING_MS", String.to_charlist("#{Map.get(settings, "endpointing_ms", 300)}")},
             {~c"TRANSLATOR_MY_LANG", String.to_charlist(Map.get(settings, "my_language", "ru"))},
             {~c"TRANSLATOR_THEIR_LANG", String.to_charlist(Map.get(settings, "their_language", "en"))},
-            {~c"TRANSLATOR_PROVIDER", String.to_charlist(Map.get(settings, "translation_provider", "auto"))}
+            {~c"TRANSLATOR_PROVIDER", String.to_charlist(Map.get(settings, "translation_provider", "auto"))},
+            {~c"LITELLM_BASE_URL", String.to_charlist(Map.get(settings, "litellm_base_url", ""))},
+            {~c"LITELLM_API_KEY", String.to_charlist(Map.get(settings, "litellm_api_key", ""))},
+            {~c"LITELLM_MODEL", String.to_charlist(Map.get(settings, "litellm_model", "ollama:ministral-3:3b-cloud"))}
           ]}
         ])
 

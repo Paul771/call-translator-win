@@ -1,4 +1,5 @@
 pub mod yandex;
+pub mod litellm;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -52,19 +53,25 @@ pub struct TranslationEngine {
     groq_key: String,
     yandex_key: String,
     yandex_folder_id: String,
+    litellm_base_url: String,
+    litellm_api_key: String,
+    litellm_model: String,
     provider: String,
     client: reqwest::blocking::Client,
 }
 
 impl TranslationEngine {
-    pub fn new(groq_key: &str, yandex_key: &str, yandex_folder_id: &str, provider: &str) -> Result<Self> {
+    pub fn new(groq_key: &str, yandex_key: &str, yandex_folder_id: &str, provider: &str,
+               litellm_base_url: &str, litellm_api_key: &str, litellm_model: &str) -> Result<Self> {
         eprintln!("[TRANSLATION] Provider: '{}'", provider);
         eprintln!("[TRANSLATION] Using GROQ_API_KEY: {}... (len={})",
-            if groq_key.len() >= 4 { &groq_key[..4] } else { "?" },
+            if groq_key.len() > 4 { &groq_key[..4] } else { "?" },
             groq_key.len());
         eprintln!("[TRANSLATION] Using YANDEX_API_KEY: {}... (len={})",
-            if yandex_key.len() >= 4 { &yandex_key[..4] } else { "?" },
+            if yandex_key.len() > 4 { &yandex_key[..4] } else { "?" },
             yandex_key.len());
+        eprintln!("[TRANSLATION] LiteLLM: url='{}' model='{}'",
+            litellm_base_url, litellm_model);
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -75,6 +82,9 @@ impl TranslationEngine {
             groq_key: groq_key.to_string(),
             yandex_key: yandex_key.to_string(),
             yandex_folder_id: yandex_folder_id.to_string(),
+            litellm_base_url: litellm_base_url.to_string(),
+            litellm_api_key: litellm_api_key.to_string(),
+            litellm_model: litellm_model.to_string(),
             provider: provider.to_string(),
             client,
         })
@@ -98,7 +108,13 @@ impl TranslationEngine {
                 }
                 bail!("Yandex selected but no valid API key")
             }
-            _ => {} // "auto" — try Groq first, fallback to Yandex
+            "litellm" => {
+                if self.litellm_api_key.len() > 2 {
+                    return self.translate_litellm(text, direction);
+                }
+                bail!("LiteLLM selected but no valid API key")
+            }
+            _ => {} // "auto" — try Groq → LiteLLM → Yandex
         }
 
         // Auto mode: try Groq first
@@ -106,9 +122,21 @@ impl TranslationEngine {
             match self.translate_groq(text, direction) {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    let err_line = format!("[FALLBACK] Groq failed: {:#}, trying Yandex", e);
+                    let err_line = format!("[FALLBACK] Groq failed: {:#}, trying LiteLLM", e);
                     eprintln!("{}", err_line);
                     log_to_file("groq_debug.log", &err_line);
+                }
+            }
+        }
+
+        // Fallback to LiteLLM
+        if self.litellm_api_key.len() > 2 && !self.litellm_base_url.is_empty() {
+            match self.translate_litellm(text, direction) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let err_line = format!("[FALLBACK] LiteLLM failed: {:#}, trying Yandex", e);
+                    eprintln!("{}", err_line);
+                    log_to_file("litellm_debug.log", &err_line);
                 }
             }
         }
@@ -119,6 +147,15 @@ impl TranslationEngine {
         }
 
         bail!("No valid API keys available for translation")
+    }
+
+    fn translate_litellm(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
+        let translator = litellm::LiteLlmTranslator::new(
+            &self.litellm_base_url,
+            &self.litellm_api_key,
+            &self.litellm_model,
+        )?;
+        translator.translate(text, &direction.from_code, &direction.to_code)
     }
 
     fn translate_groq(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
