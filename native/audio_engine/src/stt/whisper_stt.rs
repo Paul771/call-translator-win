@@ -89,7 +89,7 @@ impl WhisperSttSession {
              print(json.dumps({{'text': t, 'language': info.language, 'duration': {duration} }}))"
         );
 
-        let output = Command::new("python")
+        let output = Command::new(r"C:\Program Files\Python312\pythonw.exe")
             .args(["-c", &python_code])
             .env("WHISPER_MODEL", &self.model_name)
             .stdout(Stdio::piped())
