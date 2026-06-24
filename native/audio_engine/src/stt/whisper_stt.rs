@@ -38,12 +38,11 @@ impl WhisperSttSession {
         let audio = std::mem::take(&mut self.buffer);
         let start = std::time::Instant::now();
 
-        // Save audio to WAV file for reliable processing
+        // Save audio to WAV file
         let wav_path = std::env::temp_dir().join(format!("whisper_{}.wav", std::process::id()));
         {
             let mut f = std::fs::File::create(&wav_path)
                 .context("Failed to create temp WAV file")?;
-
             let num_samples = audio.len() as u32;
             let data_size = num_samples * 2;
             let header = [
@@ -69,18 +68,22 @@ impl WhisperSttSession {
             f.sync_all()?;
         }
 
-        // Run Whisper on the WAV file
+        // Run Whisper with WAV file path
+        let wav_str = wav_path.to_string_lossy().replace('\\', "\\\\");
+        let model = &self.model_name;
+        let duration = audio.len() as f32 / self.sample_rate as f32;
+        let python_code = format!(
+            "import json; from faster_whisper import WhisperModel; \
+             m = WhisperModel(r'{model}', device='cpu', compute_type='int8'); \
+             segs, info = m.transcribe(r'{wav_str}', beam_size=1, language=None, vad_filter=True, \
+             vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=300), \
+             no_speech_threshold=0.3, log_prob_threshold=-2.0, condition_on_previous_text=False); \
+             t = ' '.join(s.text.strip() for s in segs if len(s.text.strip()) >= 2); \
+             print(json.dumps({{'text': t, 'language': info.language, 'duration': {duration} }}))"
+        );
+
         let output = Command::new("python")
-            .args(["-c", &format!(
-                "import json, sys; from faster_whisper import WhisperModel; \
-                 m = WhisperModel('{}', device='cpu', compute_type='int8'); \
-                 segs, info = m.transcribe('{}', beam_size=1, language=None, vad_filter=True, \
-                 vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=300), \
-                 no_speech_threshold=0.3, log_prob_threshold=-2.0, condition_on_previous_text=False); \
-                 t = ' '.join(s.text.strip() for s in segs if len(s.text.strip()) >= 2); \
-                 print(json.dumps({{'text': t, 'language': info.language, 'duration': {} }}))",
-                self.model_name, wav_path.display(), audio.len() as f32 / self.sample_rate as f32
-            )])
+            .args(["-c", &python_code])
             .env("WHISPER_MODEL", &self.model_name)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -89,9 +92,14 @@ impl WhisperSttSession {
 
         let latency_ms = start.elapsed().as_millis() as u64;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         // Clean up WAV file
         let _ = std::fs::remove_file(&wav_path);
+
+        if !stderr.trim().is_empty() {
+            tracelog::trace("stt", "STT", &format!("Whisper stderr: {}", stderr.trim().lines().next().unwrap_or("")));
+        }
 
         if stdout.trim().is_empty() {
             tracelog::trace("stt", "STT", &format!("Whisper empty output after {}ms", latency_ms));
@@ -101,7 +109,7 @@ impl WhisperSttSession {
         let result: WhisperResponse = match serde_json::from_str(&stdout) {
             Ok(r) => r,
             Err(e) => {
-                tracelog::trace("stt", "ERROR", &format!("Whisper parse error: {}", e));
+                tracelog::trace("stt", "ERROR", &format!("Whisper parse error: {} | stdout: {}", e, &stdout[..200.min(stdout.len())]));
                 return Err(anyhow::anyhow!("Whisper parse error: {}", e));
             }
         };
