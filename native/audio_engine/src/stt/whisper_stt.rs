@@ -11,7 +11,7 @@ pub struct WhisperSttSession {
     last_send: std::time::Instant,
 }
 
-const BUFFER_SECS: f32 = 3.0;
+const BUFFER_SECS: f32 = 5.0;
 
 impl WhisperSttSession {
     pub fn new(sample_rate: u32, model_name: &str) -> Result<Self> {
