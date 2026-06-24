@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use crate::tracelog;
 
@@ -39,7 +41,7 @@ impl WhisperSttSession {
 
         // Skip very quiet audio to prevent Whisper hallucinations
         let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
-        if rms < 0.05 {
+        if rms < 0.08 {
             return Ok(None);
         }
 
@@ -75,33 +77,30 @@ impl WhisperSttSession {
             f.sync_all()?;
         }
 
-        // Run Whisper — use pythonw (no visible window)
-        let wav_str = wav_path.to_string_lossy().replace('\\', "\\\\");
-        let model = &self.model_name;
-        let duration = audio.len() as f32 / self.sample_rate as f32;
-        let python_code = format!(
-            "import json; from faster_whisper import WhisperModel; \
-             m = WhisperModel(r'{model}', device='cpu', compute_type='int8'); \
-             segs, info = m.transcribe(r'{wav_str}', beam_size=1, language=None, vad_filter=True, \
-             vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=400), \
-             no_speech_threshold=0.5, log_prob_threshold=-1.5, condition_on_previous_text=False); \
-             t = ' '.join(s.text.strip() for s in segs if len(s.text.strip()) >= 2); \
-             print(json.dumps({{'text': t, 'language': info.language, 'duration': {duration} }}))"
-        );
+        // Run Whisper — use wrapper script (pythonw, no visible window)
+        let result_path = std::env::temp_dir().join(format!("whisper_result_{}.json", std::process::id()));
 
-        let output = Command::new(r"C:\Program Files\Python312\pythonw.exe")
-            .args(["-c", &python_code])
+        let script_path = std::env::current_dir().unwrap_or_default().join("whisper_run.py");
+        let script_str = script_path.to_string_lossy().replace('\\', "\\\\");
+        let model = &self.model_name;
+        let wav_str = wav_path.to_string_lossy().replace('\\', "\\\\");
+        let res_str = result_path.to_string_lossy().replace('\\', "\\\\");
+
+        let mut cmd = Command::new(r"C:\Program Files\Python312\pythonw.exe");
+        cmd.arg(&script_str).arg(model).arg(&wav_str).arg(&res_str)
             .env("WHISPER_MODEL", &self.model_name)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .context("Failed to run Whisper")?;
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = cmd.output().context("Failed to run Whisper")?;
 
         let latency_ms = start.elapsed().as_millis() as u64;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-        // Clean up WAV file
+        // Read result from file
+        let stdout = std::fs::read_to_string(&result_path).unwrap_or_default();
+
+        // Clean up
         let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_file(&result_path);
 
         if stdout.trim().is_empty() {
             return Ok(None);
