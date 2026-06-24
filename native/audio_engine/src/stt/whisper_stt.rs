@@ -37,7 +37,7 @@ impl WhisperSttSession {
 
         let audio = std::mem::take(&mut self.buffer);
 
-        // Skip very quiet audio to prevent hallucinations
+        // Skip very quiet audio to prevent Whisper hallucinations
         let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
         if rms < 0.05 {
             return Ok(None);
@@ -75,7 +75,7 @@ impl WhisperSttSession {
             f.sync_all()?;
         }
 
-        // Run Whisper with WAV file path
+        // Run Whisper — use pythonw (no visible window)
         let wav_str = wav_path.to_string_lossy().replace('\\', "\\\\");
         let model = &self.model_name;
         let duration = audio.len() as f32 / self.sample_rate as f32;
@@ -89,34 +89,28 @@ impl WhisperSttSession {
              print(json.dumps({{'text': t, 'language': info.language, 'duration': {duration} }}))"
         );
 
-        let output = Command::new(r"C:\Program Files\Python312\pythonw.exe")
+        let output = Command::new("python")
             .args(["-c", &python_code])
             .env("WHISPER_MODEL", &self.model_name)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .output()
             .context("Failed to run Whisper")?;
 
         let latency_ms = start.elapsed().as_millis() as u64;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         // Clean up WAV file
         let _ = std::fs::remove_file(&wav_path);
 
-        if !stderr.trim().is_empty() {
-            tracelog::trace("stt", "STT", &format!("Whisper stderr: {}", stderr.trim().lines().next().unwrap_or("")));
-        }
-
         if stdout.trim().is_empty() {
-            tracelog::trace("stt", "STT", &format!("Whisper empty output after {}ms", latency_ms));
             return Ok(None);
         }
 
         let result: WhisperResponse = match serde_json::from_str(&stdout) {
             Ok(r) => r,
             Err(e) => {
-                tracelog::trace("stt", "ERROR", &format!("Whisper parse error: {} | stdout: {}", e, &stdout[..200.min(stdout.len())]));
+                tracelog::trace("stt", "ERROR", &format!("Whisper parse error: {}", e));
                 return Err(anyhow::anyhow!("Whisper parse error: {}", e));
             }
         };
