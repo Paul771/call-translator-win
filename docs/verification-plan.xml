@@ -1,0 +1,239 @@
+<VerificationPlan VERSION="0.2.0">
+  <GlobalPolicy>
+    <deterministic-first>true</deterministic-first>
+    <log-format>[direction][STAGE] message</log-format>
+    <required-fields>timestamp, direction (incoming/outgoing), stage, rms, latency_ms</required-fields>
+    <redaction>API keys truncated (first 4 chars only) in all env var logs</redaction>
+    <autonomy-gate>Pipeline must produce at least one FINAL transcript per 60s window to be considered functional.</autonomy-gate>
+  </GlobalPolicy>
+
+  <CriticalFlows>
+    <VF-OUTGOING NAME="OutgoingTranslationRUtoEN" PRIORITY="high">
+      <scenario>User speaks Russian into Jabra mic, remote hears English via meeting app</scenario>
+      <expected-outcome>RU→EN: STT→Translate→TTS→CABLE Input</expected-outcome>
+      <required-signals>
+        <log-marker>[outgoing] CAPTURE chunk rms>0.05 (speech detected)</log-marker>
+        <log-marker>[outgoing] STT TRANSCRIPT stt=Nms text='...'</log-marker>
+        <log-marker>[outgoing] TRANSLATE OK Nms result='...'</log-marker>
+        <log-marker>[outgoing] TTS OK Nms samples=N</log-marker>
+        <log-marker>[outgoing] PLAYBACK queued for speaker output</log-marker>
+        <log-marker>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</log-marker>
+      </required-signals>
+      <trace-sequence>CAPTURE→STT→TRANSLATE→TTS→PLAYBACK</trace-sequence>
+    </VF-OUTGOING>
+
+    <VF-INCOMING NAME="IncomingTranslationENtoRU" PRIORITY="high">
+      <scenario>Remote speaks English, captured via CABLE Output, user hears Russian</scenario>
+      <expected-outcome>EN→RU: CABLE capture→STT→Translate→TTS→Jabra speakers</expected-outcome>
+      <required-signals>
+        <log-marker>[incoming] CAPTURE chunk rms>0.05 (remote speech)</log-marker>
+        <log-marker>[incoming] STT TRANSCRIPT stt=Nms text='...'</log-marker>
+        <log-marker>[incoming] TRANSLATE OK Nms result='...'</log-marker>
+        <log-marker>[incoming] TTS OK Nms samples=N</log-marker>
+        <log-marker>[incoming] PLAYBACK queued for speaker output</log-marker>
+        <log-marker>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</log-marker>
+      </required-signals>
+      <trace-sequence>CAPTURE→STT→TRANSLATE→TTS→PLAYBACK</trace-sequence>
+    </VF-INCOMING>
+
+    <VF-FALLBACK-STT NAME="STTFallback" PRIORITY="high">
+      <scenario>Deepgram WS drops (error 10054), pipeline falls back to Whisper</scenario>
+      <expected-outcome>After 3 Deepgram drops, UnifiedSttSession switches to Whisper</expected-outcome>
+      <required-signals>
+        <log-marker>[STT] STT error: Deepgram WebSocket error</log-marker>
+        <log-marker>[STT] WHISPER stt=Nms lang=en text='...'</log-marker>
+        <log-marker>[incoming] METRICS with stt>5000ms (Whisper latency)</log-marker>
+      </required-signals>
+      <failure-expected>Deepgram WS drops every ~20-25s on unstable networks</failure-expected>
+    </VF-FALLBACK-STT>
+
+    <VF-FALLBACK-TRANSLATION NAME="TranslationFallback" PRIORITY="medium">
+      <scenario>Groq fails, falls back to LiteLLM, then Yandex</scenario>
+      <expected-outcome>Auto mode: Groq→LiteLLM→Yandex chain</expected-outcome>
+      <required-signals>
+        <log-marker>[FALLBACK] Groq failed</log-marker>
+        <log-marker>[LITELLM] OK</log-marker>
+        <log-marker>[YANDEX] Output</log-marker>
+      </required-signals>
+    </VF-FALLBACK-TRANSLATION>
+
+    <VF-AUDIO NAME="AudioCaptureStability" PRIORITY="high">
+      <scenario>Both pipelines capture audio without WASAPI errors</scenario>
+      <expected-outcome>CAPTURE batches with speech-level rms (>0.05) on outgoing pipeline</expected-outcome>
+      <required-signals>
+        <log-marker>[outgoing] CAPTURE chunk rms>0.05</log-marker>
+        <log-marker>[incoming] CAPTURE chunk rms>0.05 (when remote speaks)</log-marker>
+        <log-marker>No 0x800706CC errors in pipeline_trace.log</log-marker>
+      </required-signals>
+      <failure-expected>0x800706CC when WASAPI COM held by list_devices()</failure-expected>
+    </VF-AUDIO>
+
+    <VF-CONFIG NAME="SettingsPersistence" PRIORITY="medium">
+      <scenario>User changes device/API settings in Flask UI, pipeline restarts with new config</scenario>
+      <expected-outcome>settings.json updated, Elixir passes env vars to Rust, pipelines use new config</expected-outcome>
+      <required-signals>
+        <log-marker>[engine] ENV TRANSLATOR_MIC_DEVICE='...'</log-marker>
+        <log-marker>[engine] ENV TRANSLATOR_PROVIDER='...'</log-marker>
+        <log-marker>[engine] Starting pipelines: ["outgoing", "incoming"]</log-marker>
+      </required-signals>
+    </VF-CONFIG>
+  </CriticalFlows>
+
+  <ModuleVerification>
+    <V-M-ENGINE MODULE="M-ENGINE" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log (runtime trace)</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+        <check-2>mix compile</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Both pipelines start: outgoing captures from mic, incoming captures from CABLE Output</scenario-1>
+        <scenario-2 kind="success">Pipeline produces [outgoing][METRICS] and [incoming][METRICS] within 60s</scenario-2>
+        <scenario-3 kind="failure">0x800706CC blocks AudioCapture creation — WASAPI COM held by list_devices()</scenario-3>
+        <scenario-4 kind="failure">TTS preload timeout after 30s — ONNX model file missing or corrupted</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[engine] Starting pipeline: capture='...', playback='...'</marker>
+        <marker>[engine] Pipeline running</marker>
+        <marker>[engine] Pipeline stopped cleanly</marker>
+      </required-log-markers>
+    </V-M-ENGINE>
+
+    <V-M-STT MODULE="M-STT" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Deepgram WS connects (status=101) and produces FINAL transcript</scenario-1>
+        <scenario-2 kind="success">Whisper STT produces transcript after Deepgram drops 3 times</scenario-2>
+        <scenario-3 kind="failure">Deepgram WS drops every ~20-25s (error 10054) — network issue</scenario-3>
+        <scenario-4 kind="failure">Whisper hallucinates on short/noisy audio — model quality issue</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[STT] connecting lang=... rate=16000Hz</marker>
+        <marker>[STT] WS connected status=101</marker>
+        <marker>[STT] FINAL stt=Nms text='...'</marker>
+        <marker>[STT] WHISPER stt=Nms lang=... text='...'</marker>
+        <marker>[STT] Switched to Yandex/Whisper STT</marker>
+      </required-log-markers>
+    </V-M-STT>
+
+    <V-M-TRANSLATION MODULE="M-TRANSLATION" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log</file>
+        <file>groq_debug.log</file>
+        <file>litellm_debug.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Groq translates Russian→English correctly</scenario-1>
+        <scenario-2 kind="success">Yandex translates as fallback when Groq fails</scenario-2>
+        <scenario-3 kind="success">LiteLLM translates via AI Portal</scenario-3>
+        <scenario-4 kind="failure">TRANSLATION_TIMEOUT 12001ms — Yandex API slow or unreachable</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[outgoing/incoming] TRANSLATE OK Nms result='...'</marker>
+        <marker>[outgoing/incoming] TRANSLATION_TIMEOUT Nms</marker>
+        <marker>[FALLBACK] Groq failed</marker>
+        <marker>[LITELLM] OK: '...'</marker>
+      </required-log-markers>
+    </V-M-TRANSLATION>
+
+    <V-M-TTS MODULE="M-TTS" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Piper TTS produces audio for English text (outgoing)</scenario-1>
+        <scenario-2 kind="success">Piper TTS produces audio for Russian text (incoming)</scenario-2>
+        <scenario-3 kind="failure">TTS preload timeout — ONNX model file missing</scenario-3>
+        <scenario-4 kind="failure">TTS synthesis error at runtime</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[outgoing/incoming] TTS OK Nms samples=N</marker>
+        <marker>[outgoing/incoming] TTS engine disabled</marker>
+        <marker>[TTS] background TTS preload OK</marker>
+      </required-log-markers>
+    </V-M-TTS>
+
+    <V-M-AUDIO MODULE="M-AUDIO" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Outgoing pipeline captures speech (rms>0.05) from Jabra mic</scenario-1>
+        <scenario-2 kind="success">Incoming pipeline captures from CABLE Output</scenario-2>
+        <scenario-3 kind="failure">0x800706CC WASAPI duplicate endpoint — COM held by list_devices()</scenario-3>
+        <scenario-4 kind="failure">Playback device not found — Jabra disconnected</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[outgoing] CAPTURE chunk rms=N</marker>
+        <marker>[incoming] CAPTURE chunk rms=N</marker>
+        <marker>[DEVICE] Playback device '...' native_rate=NHz</marker>
+        <marker>[DEVICE] Outgoing playback: using meet_output_device='...'</marker>
+      </required-log-markers>
+    </V-M-AUDIO>
+
+    <V-M-WEB MODULE="M-WEB" PRIORITY="medium">
+      <test-files>
+        <file>web/routes.py</file>
+        <file>web/static/js/app.js</file>
+      </test-files>
+      <module-checks>
+        <check-1>Flask starts on port 5050</check-1>
+        <check-2>/health endpoint returns {"engine":"ready"}</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Settings page loads with current values</scenario-1>
+        <scenario-2 kind="success">Live transcript SSE stream shows [STT]/[TR]/[TOTAL] events</scenario-2>
+        <scenario-3 kind="failure">/api/devices blocks — WASAPI COM issue (fixed: returns empty)</scenario-3>
+      </scenarios>
+      <required-log-markers>
+        <marker>Flask /health returns {"engine":"ready"}</marker>
+        <marker>Flask SSE streams [STT]/[TR]/[TOTAL] events</marker>
+      </required-log-markers>
+    </V-M-WEB>
+  </ModuleVerification>
+
+  <PhaseGates>
+    <Gate-Phase-1 PHASE="Phase-1" name="Foundation">
+      <goal>Both pipelines compile, start, and produce at least one transcript within 60s</goal>
+      <commands>
+        <command-1>cargo check</command-1>
+        <command-2>mix compile</command-2>
+        <command-3>Start engine, verify pipeline_trace.log shows both pipelines running</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>[outgoing] STT TRANSCRIPT appears within 60s of pipeline start</evidence-1>
+        <evidence-2>[incoming] STT TRANSCRIPT appears within 60s of remote audio capture</evidence-1>
+        <evidence-3>No 0x800706CC errors</evidence-3>
+      </required-evidence>
+    </Gate-Phase-1>
+
+    <Gate-Phase-2 PHASE="Phase-2" name="Full Pipeline">
+      <goal>End-to-end translation works in both directions with TTS output</goal>
+      <commands>
+        <command-1>Speak Russian → verify English TTS plays via CABLE Input</command-1>
+        <command-2>Speak English on remote device → verify Russian TTS plays via Jabra</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</evidence-1>
+        <evidence-2>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</evidence-2>
+        <evidence-3>Both pipelines produce at least 3 translations per test run</evidence-3>
+      </required-evidence>
+    </Gate-Phase-2>
+  </PhaseGates>
+</VerificationPlan>

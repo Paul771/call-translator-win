@@ -1,0 +1,202 @@
+<DevelopmentPlan VERSION="0.2.0">
+  <ArchitectureNotes>
+    <objective>Bidirectional real-time voice translation with minimal latency and reliable fallback chain.</objective>
+    <non-goal>Cloud deployment, multi-user support, browser-based STT.</non-goal>
+    <risk-1>Deepgram WS instability (error 10054) causes STT gaps. Mitigated by Whisper fallback.</risk-1>
+    <risk-2>WASAPI COM references from device enumeration can block pipeline audio capture.</risk-2>
+    <risk-3>Echo feedback through CABLE if meeting app misconfigured (speaker must be CABLE Input).</risk-3>
+  </ArchitectureNotes>
+
+  <Modules>
+    <M-ENGINE NAME="Engine" TYPE="CORE_LOGIC" LAYER="0" ORDER="1" STATUS="implemented">
+      <contract>
+        <purpose>Pipeline orchestrator: manages outgoing/incoming audio pipelines, STT→Translate→TTS chain</purpose>
+        <inputs>
+          <param name="command" type="Command" />
+        </inputs>
+        <outputs>
+          <param name="event" type="Event" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-run_pipeline PURPOSE="Runs a single audio pipeline (outgoing or incoming)" />
+        <export-start_pipelines PURPOSE="Spawns both pipeline threads" />
+      </interface>
+      <depends>M-STT, M-TRANSLATION, M-TTS, M-AUDIO</depends>
+      <target>
+        <source>native/audio_engine/src/engine.rs</source>
+      </target>
+      <verification-ref>V-M-ENGINE</verification-ref>
+    </M-ENGINE>
+
+    <M-STT NAME="STT" TYPE="INTEGRATION" LAYER="1" ORDER="2" STATUS="implemented">
+      <contract>
+        <purpose>Speech-to-text via Deepgram WebSocket, Whisper local, or Yandex SpeechKit</purpose>
+        <inputs>
+          <param name="audio" type="Vec&lt;f32&gt;" />
+        </inputs>
+        <outputs>
+          <param name="SttResult" type="text + latency_ms" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-UnifiedSttSession PURPOSE="Unified STT session wrapping Deepgram/Yandex/Whisper" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>native/audio_engine/src/stt/mod.rs</source>
+        <source>native/audio_engine/src/stt/whisper_stt.rs</source>
+        <source>native/audio_engine/src/stt/yandex_stt.rs</source>
+      </target>
+      <verification-ref>V-M-STT</verification-ref>
+    </M-STT>
+
+    <M-TRANSLATION NAME="Translation" TYPE="INTEGRATION" LAYER="1" ORDER="3" STATUS="implemented">
+      <contract>
+        <purpose>Text translation via Groq, LiteLLM, or Yandex with fallback chain</purpose>
+        <inputs>
+          <param name="text" type="String" />
+          <param name="direction" type="TranslationDirection" />
+        </inputs>
+        <outputs>
+          <param name="translated" type="String" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-TranslationEngine PURPOSE="Translation with auto-fallback: Groq → LiteLLM → Yandex" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>native/audio_engine/src/translation/mod.rs</source>
+        <source>native/audio_engine/src/translation/litellm.rs</source>
+        <source>native/audio_engine/src/translation/yandex.rs</source>
+      </target>
+      <verification-ref>V-M-TRANSLATION</verification-ref>
+    </M-TRANSLATION>
+
+    <M-TTS NAME="TTS" TYPE="INTEGRATION" LAYER="1" ORDER="4" STATUS="implemented">
+      <contract>
+        <purpose>Text-to-speech via Piper ONNX models (en_US-ryan-medium, ru_RU-ruslan-medium)</purpose>
+        <inputs>
+          <param name="text" type="String" />
+        </inputs>
+        <outputs>
+          <param name="audio" type="Vec&lt;f32&gt;" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-TtsEngine PURPOSE="Piper TTS synthesis with ONNX Runtime" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>native/audio_engine/src/tts/</source>
+      </target>
+      <verification-ref>V-M-TTS</verification-ref>
+    </M-TTS>
+
+    <M-AUDIO NAME="Audio" TYPE="UTILITY" LAYER="0" ORDER="1" STATUS="implemented">
+      <contract>
+        <purpose>WASAPI audio capture (cpal) and playback with device management</purpose>
+        <inputs>
+          <param name="device_name" type="String" />
+        </inputs>
+        <outputs>
+          <param name="AudioChunk" type="samples + rate" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-AudioCapture PURPOSE="WASAPI input capture via cpal" />
+        <export-AudioPlayback PURPOSE="WASAPI output playback via cpal" />
+        <export-LoopbackCapture PURPOSE="WASAPI loopback capture from output device" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>native/audio_engine/src/audio/capture.rs</source>
+        <source>native/audio_engine/src/audio/playback.rs</source>
+        <source>native/audio_engine/src/audio/loopback.rs</source>
+      </target>
+      <verification-ref>V-M-AUDIO</verification-ref>
+    </M-AUDIO>
+
+    <M-ELIXIR NAME="ElixirOrchestrator" TYPE="ENTRY_POINT" LAYER="2" ORDER="5" STATUS="implemented">
+      <contract>
+        <purpose>Elixir GenServer managing Rust audio engine lifecycle, settings, and events</purpose>
+        <inputs>
+          <param name="command" type="JSON" />
+        </inputs>
+        <outputs>
+          <param name="event" type="JSON" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-AudioEngine PURPOSE="GenServer managing engine port" />
+        <export-CommandServer PURPOSE="TCP command server on port 5051" />
+      </interface>
+      <depends>M-ENGINE</depends>
+      <target>
+        <source>lib/translator/audio_engine.ex</source>
+        <source>lib/translator/command_server.ex</source>
+      </target>
+      <verification-ref>V-M-ELIXIR</verification-ref>
+    </M-ELIXIR>
+
+    <M-WEB NAME="FlaskWebUI" TYPE="UI_COMPONENT" LAYER="3" ORDER="6" STATUS="implemented">
+      <contract>
+        <purpose>Settings UI, live transcript display, device management</purpose>
+        <inputs>
+          <param name="request" type="HTTP" />
+        </inputs>
+        <outputs>
+          <param name="response" type="HTML/JSON" />
+        </outputs>
+      </contract>
+      <interface>
+        <export-routes PURPOSE="Flask route handlers" />
+      </interface>
+      <depends>M-ELIXIR</depends>
+      <target>
+        <source>web/routes.py</source>
+        <source>web/static/js/app.js</source>
+        <source>web/templates/index.html</source>
+      </target>
+      <verification-ref>V-M-WEB</verification-ref>
+    </M-WEB>
+  </Modules>
+
+  <DataFlow>
+    <DF-OUTGOING NAME="Outgoing Pipeline (RU→EN)" TRIGGER="User speaks">
+      <step-1>Capture audio from Jabra mic via WASAPI (cpal)</step-1>
+      <step-2>Resample to 16kHz, send to Deepgram WebSocket</step-3>
+      <step-3>Deepgram returns STT transcript (or Whisper fallback)</step-4>
+      <step-4>Translate via Groq/LiteLLM/Yandex</step-4>
+      <step-5>Synthesize English TTS via Piper</step-5>
+      <step-6>Play through CABLE Input → meeting app → conference</step-6>
+      <evidence>pipeline_trace.log: [outgoing] STT/TRANSLATE/PLAYBACK/METRICS events</evidence>
+    </DF-OUTGOING>
+
+    <DF-INCOMING NAME="Incoming Pipeline (EN→RU)" TRIGGER="Remote person speaks">
+      <step-1>Capture audio from CABLE Output (remote audio from meeting app)</step-1>
+      <step-2>Resample to 16kHz, send to Deepgram WebSocket (or Whisper)</step-3>
+      <step-3>STT transcript returned</step-3>
+      <step-4>Translate English → Russian via Groq/LiteLLM/Yandex</step-4>
+      <step-5>Synthesize Russian TTS via Piper</step-5>
+      <step-6>Play through Jabra speakers</step-6>
+      <evidence>pipeline_trace.log: [incoming] STT/TRANSLATE/PLAYBACK/METRICS events</evidence>
+    </DF-INCOMING>
+
+    <DF-CONFIG NAME="Configuration Flow" TRIGGER="User saves settings in Flask UI">
+      <step-1>User edits settings in Flask web UI (http://127.0.0.1:5050)</step-1>
+      <step-2>Settings saved to settings.json</step-2>
+      <step-3>Elixir reads settings, passes as env vars to Rust engine</step-3>
+      <step-4>Engine restarts pipelines with new config</step-4>
+      <evidence>settings.json changes, engine restart in elixir_console.log</evidence>
+    </DF-CONFIG>
+
+    <DF-FALLBACK NAME="STT Fallback Chain" TRIGGER="Primary STT fails">
+      <step-1>Try Deepgram WebSocket (primary)</step-1>
+      <step-2>After 3 disconnections, switch to Yandex SpeechKit</step-2>
+      <step-3>If Yandex unavailable, switch to local Whisper (small model)</step-3>
+      <evidence>pipeline_trace.log: Switching to Yandex/Whisper STT messages</evidence>
+    </DF-FALLBACK>
+  </DataFlow>
+</DevelopmentPlan>

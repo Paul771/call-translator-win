@@ -1,0 +1,55 @@
+<OperationalPackets VERSION="0.1.0">
+  <ExecutionPacketTemplate>
+    <ExecutionPacket>
+      <module-id>M-ENGINE</module-id>
+      <module-name>Engine</module-name>
+      <purpose>Implement or fix pipeline orchestration.</purpose>
+      <write-scope>
+        <file-1>native/audio_engine/src/engine.rs</file-1>
+      </write-scope>
+      <contract-excerpt><![CDATA[Pipeline orchestrator: manages outgoing/incoming audio pipelines, STT→Translate→TTS chain]]></contract-excerpt>
+      <verification-excerpt><![CDATA[cargo check must pass. pipeline_trace.log must show both pipelines starting.]]></verification-excerpt>
+      <assumptions>
+        <assumption-1>WASAPI audio devices are available on the system.</assumption-1>
+        <assumption-2>Python 3.12 with faster-whisper is installed for Whisper fallback.</assumption-2>
+      </assumptions>
+      <stop-conditions>
+        <condition-1>Stop if WASAPI device creation fails with 0x800706CC.</condition-1>
+        <condition-2>Stop if Deepgram API key is invalid.</condition-2>
+      </stop-conditions>
+      <retry-budget>2</retry-budget>
+    </ExecutionPacket>
+  </ExecutionPacketTemplate>
+
+  <FailurePacketTemplate>
+    <FailurePacket>
+      <scenario>Deepgram WS drops every ~20s (error 10054)</scenario>
+      <contract-ref>M-STT / V-M-STT</contract-ref>
+      <expected-evidence>
+        <marker>[STT] WS connected status=101</marker>
+        <marker>[STT] FINAL stt=...ms</marker>
+      </expected-evidence>
+      <observed-evidence>
+        <log-1>[STT] WS read error: IO error: 10054</log-1>
+        <trace-1>WS connected → 20s → 10054 error → reconnect loop</trace-1>
+      </observed-evidence>
+      <first-divergent-block>WS connected</first-divergent-block>
+      <suggested-next-action>Check network stability, disable VPN, or switch to Whisper/Yandex STT fallback.</suggested-next-action>
+    </FailurePacket>
+  </FailurePacketTemplate>
+
+  <FailurePacketTemplate>
+    <FailurePacket>
+      <scenario>WASAPI 0x800706CC blocks audio capture device creation</scenario>
+      <contract-ref>M-AUDIO / V-M-AUDIO</contract-ref>
+      <expected-evidence>
+        <marker>[CAPTURE] batch sent: N chunks</marker>
+      </expected-evidence>
+      <observed-evidence>
+        <log-1>Failed to create AudioCapture: 0x800706CC</log-1>
+      </observed-evidence>
+      <first-divergent-block>AudioCapture::new</first-divergent-block>
+      <suggested-next-action>Restart Windows Audio service, ensure no other app holds WASAPI COM references, reboot if persistent.</suggested-next-action>
+    </FailurePacket>
+  </FailurePacketTemplate>
+</OperationalPackets>

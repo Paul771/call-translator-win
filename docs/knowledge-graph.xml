@@ -1,0 +1,84 @@
+<KnowledgeGraph>
+  <Project NAME="Realtime Call Translator" VERSION="0.2.0">
+    <keywords>realtime, stt, tts, translation, voice, wasapi, deepgram, whisper, elixir, rust, python, flask, piper</keywords>
+    <annotation>Real-time bidirectional voice translator for video/voice calls.</annotation>
+
+    <M-ENGINE NAME="Engine" TYPE="CORE_LOGIC" STATUS="implemented">
+      <purpose>Pipeline orchestrator: manages outgoing/incoming audio pipelines</purpose>
+      <path>native/audio_engine/src/engine.rs</path>
+      <depends>M-STT, M-TRANSLATION, M-TTS, M-AUDIO</depends>
+      <verification-ref>V-M-ENGINE</verification-ref>
+      <annotations>
+        <fn-run_pipeline PURPOSE="Runs a single audio pipeline" />
+        <fn-start_pipelines PURPOSE="Spawns both pipeline threads" />
+        <fn-process_utterance PURPOSE="STT→Translate→TTS chain for one utterance" />
+      </annotations>
+    </M-ENGINE>
+
+    <M-STT NAME="STT" TYPE="INTEGRATION" STATUS="implemented">
+      <purpose>Speech-to-text: Deepgram WS + Whisper fallback + Yandex fallback</purpose>
+      <path>native/audio_engine/src/stt/</path>
+      <depends>none</depends>
+      <verification-ref>V-M-STT</verification-ref>
+      <annotations>
+        <type-UnifiedSttSession PURPOSE="Unified STT session enum" />
+        <fn-send_audio PURPOSE="Buffer audio for STT processing" />
+        <fn-poll_transcript PURPOSE="Get transcript from buffered audio" />
+      </annotations>
+    </M-STT>
+
+    <M-TRANSLATION NAME="Translation" TYPE="INTEGRATION" STATUS="implemented">
+      <purpose>Text translation: Groq→LiteLLM→Yandex fallback</purpose>
+      <path>native/audio_engine/src/translation/</path>
+      <depends>none</depends>
+      <verification-ref>V-M-TRANSLATION</verification-ref>
+      <annotations>
+        <type-TranslationEngine PURPOSE="Translation with auto-fallback" />
+        <fn-translate PURPOSE="Translate text with fallback chain" />
+      </annotations>
+    </M-TRANSLATION>
+
+    <M-TTS NAME="TTS" TYPE="INTEGRATION" STATUS="implemented">
+      <purpose>Text-to-speech via Piper ONNX (en/ru)</purpose>
+      <path>native/audio_engine/src/tts/</path>
+      <depends>none</depends>
+      <verification-ref>V-M-TTS</verification-ref>
+      <annotations>
+        <type-TtsEngine PURPOSE="Piper TTS synthesis" />
+      </annotations>
+    </M-TTS>
+
+    <M-AUDIO NAME="Audio" TYPE="UTILITY" STATUS="implemented">
+      <purpose>WASAPI capture (cpal) + playback + loopback</purpose>
+      <path>native/audio_engine/src/audio/</path>
+      <depends>none</depends>
+      <verification-ref>V-M-AUDIO</verification-ref>
+      <annotations>
+        <type-AudioCapture PURPOSE="WASAPI input capture" />
+        <type-AudioPlayback PURPOSE="WASAPI output playback" />
+        <type-LoopbackCapture PURPOSE="WASAPI loopback from output device" />
+      </annotations>
+    </M-AUDIO>
+
+    <M-ELIXIR NAME="ElixirOrchestrator" TYPE="ENTRY_POINT" STATUS="implemented">
+      <purpose>Elixir GenServer + TCP command server</purpose>
+      <path>lib/translator/</path>
+      <depends>M-ENGINE</depends>
+      <verification-ref>V-M-ELIXIR</verification-ref>
+    </M-ELIXIR>
+
+    <M-WEB NAME="FlaskWebUI" TYPE="UI_COMPONENT" STATUS="implemented">
+      <purpose>Settings UI + live transcript display</purpose>
+      <path>web/</path>
+      <depends>M-ELIXIR</depends>
+      <verification-ref>V-M-WEB</verification-ref>
+    </M-WEB>
+
+    <CrossLink from="M-ENGINE" to="M-STT" relation="uses for speech-to-text" />
+    <CrossLink from="M-ENGINE" to="M-TRANSLATION" relation="uses for text translation" />
+    <CrossLink from="M-ENGINE" to="M-TTS" relation="uses for text-to-speech" />
+    <CrossLink from="M-ENGINE" to="M-AUDIO" relation="uses for audio capture/playback" />
+    <CrossLink from="M-ELIXIR" to="M-ENGINE" relation="manages via port" />
+    <CrossLink from="M-WEB" to="M-ELIXIR" relation="sends commands via HTTP" />
+  </Project>
+</KnowledgeGraph>

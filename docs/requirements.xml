@@ -1,0 +1,77 @@
+<RequirementsAnalysis VERSION="0.2.0">
+  <Project>
+    <name>Realtime Call Translator</name>
+    <annotation>Real-time bidirectional voice translator for video/voice calls. Translates both sides of a conversation live.</annotation>
+    <keywords>realtime, stt, tts, translation, voice, wasapi, deepgram, whisper, elixir, rust, python, flask, piper</keywords>
+  </Project>
+
+  <Actors>
+    <actor-User>User speaking into microphone, hearing translated output through speakers/headphones.</actor-User>
+    <actor-RemotePerson>Remote participant in a conference call speaking a different language.</actor-RemotePerson>
+    <actor-System>Automated STT→Translate→TTS pipeline running on local machine.</actor-System>
+  </Actors>
+
+  <UseCases>
+    <UC-001>
+      <Actor>User</Actor>
+      <Action>Speaks in native language (e.g., Russian) into Jabra microphone</Action>
+      <Goal>Remote participant hears translation in their language (e.g., English) via meeting app</Goal>
+      <Preconditions>Meeting app running, CABLE configured, Jabra connected</Preconditions>
+      <AcceptanceCriteria>STT produces transcript, translation is correct, TTS plays through CABLE Input</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-OUTGOING</RelatedFlows>
+    </UC-002>
+    <UC-002>
+      <Actor>RemotePerson</Actor>
+      <Action>Speaks in their language (e.g., English) in conference</Action>
+      <Goal>User hears translation in native language (e.g., Russian) through Jabra speakers</Goal>
+      <Preconditions>Meeting app outputs to CABLE Input, loopback capture active</Preconditions>
+      <AcceptanceCriteria>Remote audio captured via CABLE Output, translated, TTS plays through Jabra</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-INCOMING</RelatedFlows>
+    </UC-003>
+    <UC-003>
+      <Actor>User</Actor>
+      <Action>Configures audio devices and API keys in Flask web UI</Action>
+      <Goal>Settings persist and pipeline uses correct devices/APIs</Goal>
+      <Preconditions>Flask UI accessible at http://127.0.0.1:5050</Preconditions>
+      <AcceptanceCriteria>Settings saved to settings.json, pipeline restarts with new config</AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-CONFIG</RelatedFlows>
+    </UC-004>
+    <UC-004>
+      <Actor>System</Actor>
+      <Action>Falls back to alternative STT/translation provider on failure</Action>
+      <Goal>Pipeline continues working when primary provider fails</Goal>
+      <Preconditions>Fallback provider configured with valid API key</Preconditions>
+      <AcceptanceCriteria>Deepgram→Whisper fallback for STT; Groq→LiteLLM→Yandex for translation</AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-FALLBACK</RelatedFlows>
+    </UC-004>
+  </UseCases>
+
+  <NonGoals>
+    <item-1>No cloud deployment — runs locally on user's machine</item-1>
+    <item-2>No multi-user support — single user per instance</item-2>
+    <item-3>No browser-based STT — all processing is local or via API</item-3>
+  </NonGoals>
+
+  <Constraints>
+    <constraint-1>Must run on Windows with WASAPI audio drivers</constraint-1>
+    <constraint-2>Must work with VB-Audio Virtual Cable for audio routing</constraint-2>
+    <constraint-3>Python 3.12 required for Whisper STT and Flask web UI</constraint-4>
+    <constraint-4>Deepgram WebSocket connections may be unstable on some networks</constraint-5>
+  </Constraints>
+
+  <Risks>
+    <risk-1>Deepgram WS error 10054 every ~20-25 seconds on unstable networks</risk-1>
+    <risk-2>Whisper small model produces hallucinations on short/noisy audio segments</risk-2>
+    <risk-3>WASAPI COM references from list_devices() can block pipeline audio capture</risk-3>
+    <risk-4>Echo feedback through CABLE if meeting app misconfigured</risk-4>
+  </Risks>
+
+  <OpenQuestions>
+    <question-1>Should Yandex SpeechKit STT (gRPC) replace Deepgram as primary STT?</question-1>
+    <question-2>Is WASAPI loopback viable as alternative to CABLE-based incoming pipeline?</question-2>
+  </OpenQuestions>
+</RequirementsAnalysis>

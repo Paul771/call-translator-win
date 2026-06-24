@@ -1,0 +1,44 @@
+<TechnologyStack VERSION="0.2.0">
+  <Runtime>Erlang/OTP 28 + Python 3.12</Runtime>
+  <Language>Rust 1.95.0 + Elixir 1.19.5 + Python 3.12</Language>
+  <Framework>Flask (web UI) + Elixir OTP (orchestrator)</Framework>
+
+  <Dependencies>
+    <dep name="cpal" version="0.15.3" purpose="Cross-platform audio capture/playback via WASAPI" />
+    <dep name="tungstenite" version="0.21.0" purpose="WebSocket client for Deepgram STT streaming" />
+    <dep name="reqwest" version="0.12.15" purpose="HTTP client for translation APIs (Groq, Yandex, LiteLLM)" />
+    <dep name="wasapi" version="0.23.0" purpose="WASAPI loopback capture support" />
+    <dep name="windows" version="0.62" purpose="Windows API bindings for WASAPI COM" />
+    <dep name="ort" version="2.0.0-rc.12" purpose="ONNX Runtime for Piper TTS inference" />
+    <dep name="crossbeam-channel" version="0.5.15" purpose="Thread-safe channels for pipeline data flow" />
+    <dep name="faster-whisper" version="1.2.1" purpose="Local Whisper STT via Python subprocess" />
+    <dep name="flask" version="3.x" purpose="Web UI for settings and live transcript display" />
+  </Dependencies>
+
+  <Testing>
+    <module-level>
+      <command>cargo check</command>
+      <focus>Rust compilation and type checking</focus>
+    </module-level>
+    <wave-level>
+      <command>mix compile</command>
+      <focus>Elixir compilation</focus>
+    </wave-level>
+    <phase-level>
+      <command>mix run --no-halt</command>
+      <focus>Full pipeline integration test</focus>
+    </phase-level>
+    <mocking-policy>No formal test suite. Integration testing via manual pipeline run with audio input.</mocking-policy>
+  </Testing>
+
+  <Observability>
+    <logger>tracelog module (Rust) + log crate + pipeline_trace.log</logger>
+    <log-format>[direction][STAGE] message</log-format>
+    <required-fields>timestamp, direction (incoming/outgoing), stage (STT/TRANSLATE/TTS/PLAYBACK/CAPTURE)</required-fields>
+    <redaction>API keys truncated in env var logs</redaction>
+  </Observability>
+
+  <DeliveryShape>
+    <shape>Local monolith: Elixir orchestrator + Rust audio engine (via port) + Flask web UI (separate process). All on single Windows machine.</shape>
+  </DeliveryShape>
+</TechnologyStack>
