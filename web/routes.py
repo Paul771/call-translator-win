@@ -137,18 +137,9 @@ def register_routes(app):
             result[lang] = sorted(voice_list, key=lambda x: x["name"])
         return jsonify(result)
 
-    _cached_devices = {"input": [], "output": []}
-
     @app.route("/api/devices")
     def api_devices():
-        nonlocal _cached_devices
-        if not _cached_devices.get("input"):
-            try:
-                _cached_devices = list_audio_devices()
-            except Exception as e:
-                logger.warning(f"Device listing failed: {e}")
-                _cached_devices = {"input": [], "output": []}
-        return jsonify(_cached_devices)
+        return jsonify({"input": [], "output": []})
 
     @app.route("/api/tts-preview", methods=["POST"])
     def tts_preview():
