@@ -36,6 +36,13 @@ impl WhisperSttSession {
         }
 
         let audio = std::mem::take(&mut self.buffer);
+
+        // Skip very quiet audio to prevent hallucinations
+        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
+        if rms < 0.05 {
+            return Ok(None);
+        }
+
         let start = std::time::Instant::now();
 
         // Save audio to WAV file
@@ -76,13 +83,13 @@ impl WhisperSttSession {
             "import json; from faster_whisper import WhisperModel; \
              m = WhisperModel(r'{model}', device='cpu', compute_type='int8'); \
              segs, info = m.transcribe(r'{wav_str}', beam_size=1, language=None, vad_filter=True, \
-             vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=300), \
-             no_speech_threshold=0.3, log_prob_threshold=-2.0, condition_on_previous_text=False); \
+             vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=400), \
+             no_speech_threshold=0.5, log_prob_threshold=-1.5, condition_on_previous_text=False); \
              t = ' '.join(s.text.strip() for s in segs if len(s.text.strip()) >= 2); \
              print(json.dumps({{'text': t, 'language': info.language, 'duration': {duration} }}))"
         );
 
-        let output = Command::new("python")
+        let output = Command::new(r"C:\Program Files\Python312\pythonw.exe")
             .args(["-c", &python_code])
             .env("WHISPER_MODEL", &self.model_name)
             .stdout(Stdio::piped())
