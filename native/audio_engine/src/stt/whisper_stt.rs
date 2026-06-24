@@ -1,57 +1,23 @@
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use crate::tracelog;
 
-/// Persistent Whisper STT process. Model stays loaded in Python memory.
-/// No new process per request = no window flashing.
 pub struct WhisperSttSession {
-    child: Mutex<Child>,
     buffer: Vec<f32>,
     sample_rate: u32,
     model_name: String,
 }
 
-const BUFFER_SECS: f32 = 5.0;
+const BUFFER_SECS: f32 = 2.0;
 
 impl WhisperSttSession {
     pub fn new(sample_rate: u32, model_name: &str) -> Result<Self> {
-        let mut child = Command::new("python")
-            .arg("whisper_stt.py")
-            .env("WHISPER_MODEL", model_name)
-            .env("WHISPER_DEVICE", "cpu")
-            .env("WHISPER_COMPUTE", "int8")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to start whisper_stt.py")?;
-
-        // Wait for model to load
-        let mut stderr = child.stderr.take().unwrap();
-        let mut buf = [0u8; 1024];
-        let mut model_loaded = false;
-        let start = std::time::Instant::now();
-        while start.elapsed().as_secs() < 30 {
-            let n = stderr.read(&mut buf).unwrap_or(0);
-            if n > 0 {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                if msg.contains("Model loaded") {
-                    model_loaded = true;
-                    tracelog::trace("stt", "STT", &format!("Whisper model loaded: {}", msg.trim()));
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        if !model_loaded {
-            tracelog::trace("stt", "STT", "Whisper model may still be loading...");
-        }
-
+        tracelog::trace("stt", "STT", &format!(
+            "Local Whisper STT initialized (model={}, rate={}Hz)", model_name, sample_rate
+        ));
         Ok(Self {
-            child: Mutex::new(child),
             buffer: Vec::new(),
             sample_rate,
             model_name: model_name.to_string(),
@@ -72,52 +38,70 @@ impl WhisperSttSession {
         let audio = std::mem::take(&mut self.buffer);
         let start = std::time::Instant::now();
 
-        let mut child = self.child.lock().unwrap();
+        // Save audio to WAV file for reliable processing
+        let wav_path = std::env::temp_dir().join(format!("whisper_{}.wav", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&wav_path)
+                .context("Failed to create temp WAV file")?;
 
-        // Send header (sample_rate as u32 LE) + audio data
-        if let Some(ref mut stdin) = child.stdin {
-            let _ = stdin.write_all(&self.sample_rate.to_le_bytes());
+            let num_samples = audio.len() as u32;
+            let data_size = num_samples * 2;
+            let header = [
+                b'R', b'I', b'F', b'F',
+                (36 + data_size) as u8, ((36 + data_size) >> 8) as u8, ((36 + data_size) >> 16) as u8, ((36 + data_size) >> 24) as u8,
+                b'W', b'A', b'V', b'E',
+                b'f', b'm', b't', b' ',
+                16u8, 0, 0, 0,
+                1u8, 0,
+                1u8, 0,
+                (self.sample_rate) as u8, (self.sample_rate >> 8) as u8, 0, 0,
+                (self.sample_rate * 2) as u8, ((self.sample_rate * 2) >> 8) as u8, 0, 0,
+                2u8, 0,
+                16u8, 0,
+                b'd', b'a', b't', b'a',
+                data_size as u8, (data_size >> 8) as u8, (data_size >> 16) as u8, (data_size >> 24) as u8,
+            ];
+            f.write_all(&header)?;
             for &sample in &audio {
-                let _ = stdin.write_all(&sample.to_le_bytes());
+                let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                f.write_all(&s16.to_le_bytes())?;
             }
-            let _ = stdin.flush();
+            f.sync_all()?;
         }
 
-        // Read response
-        let mut stdout = child.stdout.take().unwrap();
-        let mut response = String::new();
-        let read_start = std::time::Instant::now();
-        let mut buf = [0u8; 4096];
-        while read_start.elapsed().as_secs() < 60 {
-            match stdout.read(&mut buf) {
-                Ok(0) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    continue;
-                }
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]);
-                    response.push_str(&chunk);
-                    if response.contains('\n') {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    continue;
-                }
-            }
-        }
+        // Run Whisper on the WAV file
+        let output = Command::new("python")
+            .args(["-c", &format!(
+                "import json, sys; from faster_whisper import WhisperModel; \
+                 m = WhisperModel('{}', device='cpu', compute_type='int8'); \
+                 segs, info = m.transcribe('{}', beam_size=1, language=None, vad_filter=True, \
+                 vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=300), \
+                 no_speech_threshold=0.3, log_prob_threshold=-2.0, condition_on_previous_text=False); \
+                 t = ' '.join(s.text.strip() for s in segs if len(s.text.strip()) >= 2); \
+                 print(json.dumps({{'text': t, 'language': info.language, 'duration': {} }}))",
+                self.model_name, wav_path.display(), audio.len() as f32 / self.sample_rate as f32
+            )])
+            .env("WHISPER_MODEL", &self.model_name)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("Failed to run Whisper")?;
 
-        // Put stdout back
-        child.stdout = Some(stdout);
-
-        let response = response.trim().to_string();
         let latency_ms = start.elapsed().as_millis() as u64;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-        let result: WhisperResponse = match serde_json::from_str(&response) {
+        // Clean up WAV file
+        let _ = std::fs::remove_file(&wav_path);
+
+        if stdout.trim().is_empty() {
+            tracelog::trace("stt", "STT", &format!("Whisper empty output after {}ms", latency_ms));
+            return Ok(None);
+        }
+
+        let result: WhisperResponse = match serde_json::from_str(&stdout) {
             Ok(r) => r,
             Err(e) => {
-                tracelog::trace("stt", "ERROR", &format!("Whisper parse error: {} | raw: {}", e, response));
+                tracelog::trace("stt", "ERROR", &format!("Whisper parse error: {}", e));
                 return Err(anyhow::anyhow!("Whisper parse error: {}", e));
             }
         };
@@ -133,14 +117,6 @@ impl WhisperSttSession {
             }))
         } else {
             Ok(None)
-        }
-    }
-}
-
-impl Drop for WhisperSttSession {
-    fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
         }
     }
 }

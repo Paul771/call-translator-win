@@ -1,7 +1,6 @@
 """
-Persistent Whisper STT server - reads audio from stdin, outputs transcript to stdout.
-Keeps model loaded in memory for fast repeated transcriptions.
-No new process per request = no window flashing.
+Whisper STT - reads audio from stdin, outputs transcript to stdout.
+Debug version: logs audio stats.
 """
 import sys
 import struct
@@ -19,7 +18,6 @@ def main():
     print(f"[whisper] Model loaded: {model_size}", file=sys.stderr)
     sys.stderr.flush()
 
-    # Read audio in a loop from stdin
     while True:
         header = sys.stdin.buffer.read(4)
         if len(header) < 4:
@@ -37,10 +35,22 @@ def main():
         audio = np.array(samples, dtype=np.float32)
 
         duration = float(len(audio)) / sample_rate
-        if duration < 0.5:
+        rms = float(np.sqrt(np.mean(audio**2)))
+        peak = float(np.max(np.abs(audio)))
+        print(f"[whisper] Audio: dur={duration:.2f}s rms={rms:.4f} peak={peak:.4f} samples={num_samples}", file=sys.stderr)
+        sys.stderr.flush()
+
+        if duration < 1.0:
             print(json.dumps({"text": "", "language": "en", "duration": duration}))
             sys.stdout.flush()
             continue
+
+        # Amplify very quiet audio
+        if rms > 0 and rms < 0.1:
+            gain = min(0.3 / rms, 10.0)
+            audio = audio * gain
+            print(f"[whisper] Amplified by {gain:.1f}x, new rms={float(np.sqrt(np.mean(audio**2))):.4f}", file=sys.stderr)
+            sys.stderr.flush()
 
         segments, info = model.transcribe(
             audio,
@@ -48,21 +58,24 @@ def main():
             language=None,
             vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=200,
+                min_silence_duration_ms=300,
+                speech_pad_ms=300,
             ),
-            no_speech_threshold=0.6,
-            log_prob_threshold=-1.0,
+            no_speech_threshold=0.3,
+            log_prob_threshold=-2.0,
             condition_on_previous_text=False,
         )
 
         text_parts = []
         for segment in segments:
             t = segment.text.strip()
-            if len(t) >= 3:
+            if len(t) >= 2:
                 text_parts.append(t)
 
         transcript = ' '.join(text_parts).strip()
+        print(f"[whisper] Result: text='{transcript}' lang={info.language}", file=sys.stderr)
+        sys.stderr.flush()
+
         result = {
             "text": transcript,
             "language": info.language,
