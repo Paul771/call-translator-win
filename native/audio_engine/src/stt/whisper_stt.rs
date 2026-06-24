@@ -41,7 +41,7 @@ impl WhisperSttSession {
 
         // Skip very quiet audio to prevent Whisper hallucinations
         let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
-        if rms < 0.08 {
+        if rms < 0.25 {
             return Ok(None);
         }
 
