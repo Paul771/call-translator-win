@@ -621,9 +621,9 @@ fn run_pipeline(
             &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
         )?)
     } else if stt_provider == "whisper" {
-        info!("[{}] Using local Whisper STT (model={})", direction, whisper_model);
+        info!("[{}] Using local Whisper STT (model={}, lang={})", direction, whisper_model, stt_language);
         UnifiedSttSession::Whisper(crate::stt::whisper_stt::WhisperSttSession::new(
-            stt_sample_rate, &whisper_model,
+            stt_sample_rate, &whisper_model, &stt_language,
         )?)
     } else if stt_provider == "deepgram" || stt_provider == "auto" {
         // Try Deepgram first
@@ -641,7 +641,7 @@ fn run_pipeline(
             Err(e) if stt_provider == "auto" => {
                 warn!("[{}] Deepgram failed ({}), falling back to local Whisper STT", direction, e);
                 UnifiedSttSession::Whisper(crate::stt::whisper_stt::WhisperSttSession::new(
-                    stt_sample_rate, &whisper_model,
+                    stt_sample_rate, &whisper_model, &stt_language,
                 )?)
             }
             Err(e) => {
@@ -801,11 +801,13 @@ fn run_pipeline(
     let mut need_reconnect = false;
     let mut reconnect_attempts: u32 = 0;
     let mut deepgram_drop_count: u32 = 0;
-    const MAX_DEEPGRAM_DROPS: u32 = 3;
-    const MAX_BACKOFF_MS: u64 = 30000;
+    const MAX_DEEPGRAM_DROPS: u32 = 10;
+    const MAX_BACKOFF_MS: u64 = 5000;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
     let mut last_audio_sent = Instant::now();
+    let mut last_transcript_time = Instant::now();
+    let mut speech_chunks_since_transcript: u64 = 0;
     loop {
         if stop_flag.load(Ordering::SeqCst) {
             info!("[{}] Stop flag set, exiting", direction);
@@ -815,7 +817,7 @@ fn run_pipeline(
         if need_reconnect {
             reconnect_attempts += 1;
             let backoff_ms = std::cmp::min(
-                2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
+                500u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
                 MAX_BACKOFF_MS,
             );
             info!("[{}] Reconnecting STT (attempt #{}, {}ms backoff, drop_count={})...", direction, reconnect_attempts, backoff_ms, deepgram_drop_count);
@@ -839,7 +841,7 @@ fn run_pipeline(
                 // If Yandex failed or not available, use local Whisper
                 if !matches!(session, UnifiedSttSession::Whisper(_)) {
                     warn!("[{}] Switching to local Whisper STT", direction);
-                    match crate::stt::whisper_stt::WhisperSttSession::new(stt_sample_rate, &whisper_model) {
+                    match crate::stt::whisper_stt::WhisperSttSession::new(stt_sample_rate, &whisper_model, &stt_language) {
                         Ok(ws) => {
                             session = UnifiedSttSession::Whisper(ws);
                             need_reconnect = false;
@@ -861,6 +863,8 @@ fn run_pipeline(
                     session = UnifiedSttSession::Deepgram(new_session);
                     need_reconnect = false;
                     reconnect_attempts = 0;
+                    last_transcript_time = Instant::now();
+                    speech_chunks_since_transcript = 0;
                     info!("[{}] Deepgram reconnected (drop_count={})", direction, deepgram_drop_count);
                 }
                 Err(e) => {
@@ -881,14 +885,18 @@ fn run_pipeline(
             let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
             if rms > 0.01 { total_chunks_with_audio += 1; }
             if chunks_sent < 3 || (loop_count % 500 == 0 && rms > 0.01) {
-                tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}, capture_rate={}Hz→{}Hz", samples_16k.len(), rms, capture_rate, stt_sample_rate));
+                tracelog::trace(direction, "CAPTURE", &format!("chunk {} samples, rms={:.6}, raw_rms={:.6}, capture_rate={}Hz→{}Hz", samples_16k.len(), rms, chunk.raw_rms, capture_rate, stt_sample_rate));
             }
-            if let Err(e) = session.send_audio(&samples_16k) {
+            if let Err(e) = session.send_audio(&samples_16k, chunk.raw_rms) {
                 warn!("[{}] STT send error: {:#}", direction, e);
                 tracelog::trace(direction, "ERROR", &format!("STT send FAILED: {}", e));
                 deepgram_drop_count += 1;
                 need_reconnect = true;
                 break;
+            }
+            if chunk.raw_rms > 0.015 {
+                speech_chunks_since_transcript += 1;
+                tracelog::trace(direction, "STT", &format!("raw_rms={:.6} sent to STT", chunk.raw_rms));
             }
             chunks_sent += 1;
         }
@@ -898,13 +906,13 @@ fn run_pipeline(
                 tracelog::trace(direction, "CAPTURE", &format!("batch sent: {} chunks ({} with speech), total_loop={}", chunks_sent, total_chunks_with_audio, loop_count));
             }
         }
-        // Send silence keepalive every ~8s when no audio was captured, to prevent
+        // Send silence keepalive every ~4s when no audio was captured, to prevent
         // Deepgram server-side idle timeout (~12s when no data arrives).
         if chunks_sent == 0 && !need_reconnect {
-            if last_audio_sent.elapsed() >= Duration::from_secs(8) {
+            if last_audio_sent.elapsed() >= Duration::from_secs(4) {
                 let silence_samples = (stt_sample_rate as u64 * 8 / 1000) as usize;
                 let silence: Vec<f32> = vec![0.0; silence_samples];
-                if let Err(e) = session.send_audio(&silence) {
+                if let Err(e) = session.send_audio(&silence, 0.0) {
                     warn!("[{}] STT keepalive send error: {:#}", direction, e);
                     deepgram_drop_count += 1;
                     need_reconnect = true;
@@ -929,13 +937,28 @@ fn run_pipeline(
         match session.poll_transcript() {
             Ok(Some(result)) => {
                 tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
+                last_transcript_time = Instant::now();
+                speech_chunks_since_transcript = 0;
                 if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms)) {
                     warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
                 } else {
                     tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // Detect stale session: audio sent for 8s+ but no transcript at all
+                if speech_chunks_since_transcript > 0
+                    && last_transcript_time.elapsed() >= Duration::from_secs(8)
+                {
+                    warn!("[{}] No transcript for {}s after {} speech chunks — forcing reconnect",
+                        direction, last_transcript_time.elapsed().as_secs(), speech_chunks_since_transcript);
+                    tracelog::trace(direction, "ERROR", &format!(
+                        "Stale Deepgram session ({}s, {} chunks) — reconnecting",
+                        last_transcript_time.elapsed().as_secs(), speech_chunks_since_transcript));
+                    deepgram_drop_count += 1;
+                    need_reconnect = true;
+                }
+            }
             Err(e) => {
                 error!("[{}] STT error: {:#}", direction, e);
                 tracelog::trace(direction, "ERROR", &format!("STT error: {}", e));

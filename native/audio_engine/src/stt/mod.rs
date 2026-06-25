@@ -295,11 +295,11 @@ pub enum UnifiedSttSession {
 }
 
 impl UnifiedSttSession {
-    pub fn send_audio(&mut self, samples: &[f32]) -> Result<()> {
+    pub fn send_audio(&mut self, samples: &[f32], raw_rms: f32) -> Result<()> {
         match self {
             Self::Deepgram(s) => s.send_audio(samples),
             Self::Yandex(s) => s.send_audio(samples),
-            Self::Whisper(s) => s.send_audio(samples),
+            Self::Whisper(s) => s.send_audio(samples, raw_rms),
         }
     }
 

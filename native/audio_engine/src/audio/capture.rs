@@ -8,6 +8,7 @@ use log::{debug, error, info};
 
 pub struct AudioChunk {
     pub samples: Vec<f32>,
+    pub raw_rms: f32,
 }
 
 fn log_file_cap(msg: &str) {
@@ -87,7 +88,7 @@ impl AudioCapture {
                     if prev % 200 == 0 || rms > 0.001 {
                         info!("[{}] gain={:.1}, rms={:.6}, adaptive_gain={:.1}, first_sample={:.4}", prev+1, effective_gain, rms, adaptive_gain, data.first().copied().unwrap_or(0.0));
                     }
-                    let chunk = AudioChunk { samples: mono };
+                    let chunk = AudioChunk { samples: mono, raw_rms: rms_raw };
                     if let Err(e) = sender.try_send(chunk) {
                         debug!("Capture channel full or disconnected: {}", e);
                     }

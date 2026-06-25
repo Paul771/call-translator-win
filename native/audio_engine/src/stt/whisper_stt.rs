@@ -7,41 +7,96 @@ use std::os::windows::process::CommandExt;
 use crate::tracelog;
 
 pub struct WhisperSttSession {
-    buffer: Vec<f32>,
+    speech_buffer: Vec<f32>,
     sample_rate: u32,
     model_name: String,
+    language: String,
+    raw_rms_sum: f64,
+    raw_rms_count: u64,
+    speech_active: bool,
+    silence_chunks: u32,
 }
 
 const BUFFER_SECS: f32 = 2.0;
+const SPEECH_THRESHOLD: f32 = 0.001;
+const SILENCE_TIMEOUT_CHUNKS: u32 = 15;
 
 impl WhisperSttSession {
-    pub fn new(sample_rate: u32, model_name: &str) -> Result<Self> {
+    pub fn new(sample_rate: u32, model_name: &str, language: &str) -> Result<Self> {
         tracelog::trace("stt", "STT", &format!(
-            "Local Whisper STT initialized (model={}, rate={}Hz)", model_name, sample_rate
+            "Local Whisper STT initialized (model={}, lang={}, rate={}Hz)", model_name, language, sample_rate
         ));
         Ok(Self {
-            buffer: Vec::new(),
+            speech_buffer: Vec::new(),
             sample_rate,
             model_name: model_name.to_string(),
+            language: language.to_string(),
+            raw_rms_sum: 0.0,
+            raw_rms_count: 0,
+            speech_active: false,
+            silence_chunks: 0,
         })
     }
 
-    pub fn send_audio(&mut self, samples: &[f32]) -> Result<()> {
-        self.buffer.extend_from_slice(samples);
+    pub fn send_audio(&mut self, samples: &[f32], raw_rms: f32) -> Result<()> {
+        if raw_rms >= SPEECH_THRESHOLD {
+            if !self.speech_active {
+                self.speech_active = true;
+                self.silence_chunks = 0;
+                self.raw_rms_sum = 0.0;
+                self.raw_rms_count = 0;
+                tracelog::trace("stt", "STT", &format!(
+                    "VAD: speech started (raw_rms={:.4})", raw_rms
+                ));
+            }
+            self.silence_chunks = 0;
+            self.raw_rms_sum += raw_rms as f64;
+            self.raw_rms_count += 1;
+            self.speech_buffer.extend_from_slice(samples);
+        } else if self.speech_active {
+            self.silence_chunks += 1;
+            if self.silence_chunks >= SILENCE_TIMEOUT_CHUNKS {
+                let speech_duration = self.speech_buffer.len() as f32 / self.sample_rate as f32;
+                tracelog::trace("stt", "STT", &format!(
+                    "VAD: speech ended after {:.2}s ({} samples, silence_chunks={})",
+                    speech_duration, self.speech_buffer.len(), self.silence_chunks
+                ));
+                self.speech_active = false;
+                self.silence_chunks = 0;
+            }
+        }
+
         Ok(())
     }
 
     pub fn poll_transcript(&mut self) -> Result<Option<super::SttResult>> {
-        let buffer_duration = self.buffer.len() as f32 / self.sample_rate as f32;
-        if buffer_duration < BUFFER_SECS {
+        let speech_samples = self.speech_buffer.len();
+        let speech_duration = speech_samples as f32 / self.sample_rate as f32;
+        let has_speech = speech_samples > 0 && speech_duration >= 0.1;
+
+        let should_process = if has_speech && !self.speech_active {
+            true
+        } else if has_speech && speech_duration >= BUFFER_SECS {
+            true
+        } else {
+            false
+        };
+
+        if !should_process {
             return Ok(None);
         }
 
-        let audio = std::mem::take(&mut self.buffer);
+        let audio = std::mem::take(&mut self.speech_buffer);
 
-        // Skip very quiet audio to prevent Whisper hallucinations
-        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
-        if rms < 0.25 {
+        let avg_raw_rms = if self.raw_rms_count > 0 {
+            (self.raw_rms_sum / self.raw_rms_count as f64) as f32
+        } else {
+            0.0
+        };
+        self.raw_rms_sum = 0.0;
+        self.raw_rms_count = 0;
+
+        if avg_raw_rms < SPEECH_THRESHOLD {
             return Ok(None);
         }
 
@@ -86,11 +141,13 @@ impl WhisperSttSession {
         let wav_str = wav_path.to_string_lossy().replace('\\', "\\\\");
         let res_str = result_path.to_string_lossy().replace('\\', "\\\\");
 
-        let mut cmd = Command::new(r"C:\Program Files\Python312\pythonw.exe");
-        cmd.arg(&script_str).arg(model).arg(&wav_str).arg(&res_str)
+        let mut cmd = Command::new(r"C:\Program Files\Python312\python.exe");
+        cmd.arg(&script_str).arg(model).arg(&wav_str).arg(&res_str).arg(&self.language)
             .env("WHISPER_MODEL", &self.model_name)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         let _ = cmd.output().context("Failed to run Whisper")?;
 
         let latency_ms = start.elapsed().as_millis() as u64;

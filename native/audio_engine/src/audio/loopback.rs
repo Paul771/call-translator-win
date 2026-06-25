@@ -175,7 +175,7 @@ fn run_loopback_inner(
                     debug!("[loopback] chunk #{} ({} samples, rms={:.6})", count + 1, mono_samples.len(), rms);
                 }
 
-                let chunk = AudioChunk { samples: mono_samples };
+                let chunk = AudioChunk { samples: mono_samples, raw_rms: rms };
                 if sender.send(chunk).is_err() {
                     debug!("[loopback] Receiver dropped, stopping");
                     break;

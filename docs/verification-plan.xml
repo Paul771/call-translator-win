@@ -77,6 +77,36 @@
         <log-marker>[engine] Starting pipelines: ["outgoing", "incoming"]</log-marker>
       </required-signals>
     </VF-CONFIG>
+
+    <VF-RAW-RMS NAME="RawRmsNoiseFilter" PRIORITY="high" verified="2026-06-14">
+      <scenario>Whisper STT receives background noise (raw_rms &lt; 0.015) and must NOT produce hallucinated transcripts</scenario>
+      <expected-outcome>Avg raw_rms across buffer is computed from pre-gain values; if below 0.015, poll_transcript returns None without invoking Python/Whisper</expected-outcome>
+      <required-signals>
+        <log-marker>Capture chunk #N (... rms_raw=0.0000XX) — raw RMS logged in deepgram_debug.log</log-marker>
+        <marker>No [STT] WHISPER log entries when raw_rms &lt; 0.015</marker>
+      </required-signals>
+      <trace-sequence>CAPTURE(raw_rms)→WhisperSttSession.send_audio(raw_rms)→poll_transcript(avg_raw_rms check)→None(skip)</trace-sequence>
+      <test-evidence>
+        <evidence type="trace-assertion">deepgram_debug.log shows rms_raw=0.000052-0.000060 for ambient noise chunks</evidence>
+        <evidence type="trace-assertion">pipeline_trace.log shows no WHISPER/TRANSCRIPT entries during quiet periods</evidence>
+        <evidence type="deterministic">cargo check passes with raw_rms field in AudioChunk and WhisperSttSession</evidence>
+      </test-evidence>
+      <failure-expected>If adaptive gain boosts noise to amplified RMS 0.25, old code would trigger Whisper; new raw_rms filter prevents this</failure-expected>
+    </VF-RAW-RMS>
+
+    <VF-WINDOW-HIDE NAME="WhisperWindowHide" PRIORITY="high" verified="2026-06-14">
+      <scenario>Whisper STT launches Python subprocess for transcription — must not create visible console windows</scenario>
+      <expected-outcome>python.exe used with creation_flags(0x08000000) CREATE_NO_WINDOW; no window flash observed during Whisper invocation</expected-outcome>
+      <required-signals>
+        <marker>No python.exe or pythonw.exe MainWindowTitle visible during STT processing</marker>
+        <marker>[STT] WHISPER stt=Nms lang=... text='...' — Whisper produces output without window</marker>
+      </required-signals>
+      <test-evidence>
+        <evidence type="deterministic">Get-Process -Name "python*" returns no entries with MainWindowTitle during pipeline operation</evidence>
+        <evidence type="deterministic">whisper_stt.rs:109 contains cmd.creation_flags(0x08000000) with python.exe path</evidence>
+        <evidence type="trace-assertion">WAV files created in TEMP confirm Whisper subprocess was invoked</evidence>
+      </test-evidence>
+    </VF-WINDOW-HIDE>
   </CriticalFlows>
 
   <ModuleVerification>
@@ -104,6 +134,7 @@
     <V-M-STT MODULE="M-STT" PRIORITY="high">
       <test-files>
         <file>pipeline_trace.log</file>
+        <file>deepgram_debug.log</file>
       </test-files>
       <module-checks>
         <check-1>cargo check</check-1>
@@ -113,6 +144,10 @@
         <scenario-2 kind="success">Whisper STT produces transcript after Deepgram drops 3 times</scenario-2>
         <scenario-3 kind="failure">Deepgram WS drops every ~20-25s (error 10054) — network issue</scenario-3>
         <scenario-4 kind="failure">Whisper hallucinates on short/noisy audio — model quality issue</scenario-4>
+        <scenario-5 kind="success" verified="2026-06-14">Whisper filters background noise: avg_raw_rms &lt; 0.015 causes poll_transcript to return None. Evidence: rms_raw=0.000052-0.000060 in deepgram_debug.log, no WHISPER entries in pipeline_trace.log</scenario-5>
+        <scenario-6 kind="success" verified="2026-06-14">Whisper passes speech: avg_raw_rms >= 0.015 triggers Whisper invocation. Evidence: rms_raw=0.05-0.07, WAV files created in TEMP, python.exe launched with CREATE_NO_WINDOW</scenario-6>
+        <scenario-7 kind="success" verified="2026-06-14">Whisper subprocess uses python.exe + CREATE_NO_WINDOW (0x08000000) — no visible window. Evidence: Get-Process shows no python MainWindowTitle</scenario-7>
+        <scenario-8 kind="known-limitation" verified="2026-06-14">Whisper 2-second buffer dilutes brief speech with surrounding silence. WAV files are 99.6% silence (250 non-zero bytes out of 64000). Whisper receives mostly silence and produces empty text. Root cause: buffer accumulates all audio for BUFFER_SECS=2.0, not just speech segments. Fix: reduce buffer to 1s or add VAD-based segmentation.</scenario-8>
       </scenarios>
       <required-log-markers>
         <marker>[STT] connecting lang=... rate=16000Hz</marker>
@@ -120,6 +155,8 @@
         <marker>[STT] FINAL stt=Nms text='...'</marker>
         <marker>[STT] WHISPER stt=Nms lang=... text='...'</marker>
         <marker>[STT] Switched to Yandex/Whisper STT</marker>
+        <marker>[STT] Local Whisper STT initialized (model=... rate=16000Hz)</marker>
+        <marker>Capture chunk #N (... rms_raw=...) — raw_rms logged in deepgram_debug.log</marker>
       </required-log-markers>
     </V-M-STT>
 
@@ -169,6 +206,7 @@
     <V-M-AUDIO MODULE="M-AUDIO" PRIORITY="high">
       <test-files>
         <file>pipeline_trace.log</file>
+        <file>deepgram_debug.log</file>
       </test-files>
       <module-checks>
         <check-1>cargo check</check-1>
@@ -178,12 +216,15 @@
         <scenario-2 kind="success">Incoming pipeline captures from CABLE Output</scenario-2>
         <scenario-3 kind="failure">0x800706CC WASAPI duplicate endpoint — COM held by list_devices()</scenario-3>
         <scenario-4 kind="failure">Playback device not found — Jabra disconnected</scenario-4>
+        <scenario-5 kind="success" verified="2026-06-14">AudioChunk.raw_rms is set from pre-gain RMS in capture callback (capture.rs:91). Evidence: deepgram_debug.log shows rms_raw=0.000052-0.076735 values</scenario-5>
+        <scenario-6 kind="success" verified="2026-06-14">Loopback AudioChunk.raw_rms equals loopback signal RMS (loopback.rs:178). Evidence: loopback pipeline shows rms=0.000000 for inactive CABLE Output</scenario-6>
       </scenarios>
       <required-log-markers>
         <marker>[outgoing] CAPTURE chunk rms=N</marker>
         <marker>[incoming] CAPTURE chunk rms=N</marker>
         <marker>[DEVICE] Playback device '...' native_rate=NHz</marker>
         <marker>[DEVICE] Outgoing playback: using meet_output_device='...'</marker>
+        <marker>Capture chunk #N (... samples, first=..., rms_raw=...) — raw_rms in deepgram_debug.log</marker>
       </required-log-markers>
     </V-M-AUDIO>
 
@@ -236,4 +277,35 @@
       </required-evidence>
     </Gate-Phase-2>
   </PhaseGates>
+
+  <VerificationLevels>
+    <Level-MODULE name="Module Level" scope="Per-file typecheck, lint, local trace checks">
+      <command>cargo check</command>
+      <command>mix compile</command>
+      <focus>Rust/Elixir compilation, type correctness, local log marker presence</focus>
+    </Level-MODULE>
+    <Level-WAVE name="Wave Level" scope="Integration checks for merged surfaces">
+      <command>Start engine, verify pipeline_trace.log shows both pipelines running</command>
+      <command>Check deepgram_debug.log for raw_rms values</command>
+      <focus>End-to-end audio capture, STT invocation, translation, TTS playback</focus>
+    </Level-WAVE>
+    <Level-PHASE name="Phase Level" scope="Full suite, broad traceability, confidence checks">
+      <command>Speak Russian → verify English TTS plays via CABLE Input</command>
+      <command>Speak English on remote device → verify Russian TTS plays via Jabra</command>
+      <focus>Both directions working, no hallucinations, no window flash, no WASAPI errors</focus>
+    </Level-PHASE>
+  </VerificationLevels>
+
+  <AutonomyAssessment ASSESSMENT_DATE="2026-06-14">
+    <module-local-commands>YES — cargo check (8s), mix compile (2s) run quickly</module-local-commands>
+    <success-failure-scenarios>YES — 8 STT scenarios, 6 Audio scenarios, 7 critical flows</success-failure-scenarios>
+    <observable-divergence>YES — raw_rms logged per chunk, WHISPER/TRANSCRIPT markers present</observable-divergence>
+    <wave-phase-followup>YES — Phase gates defined with evidence requirements</wave-phase-followup>
+    <execution-packet-fields>SUFFICIENT — named fields for failure handoff</execution-packet-fields>
+    <gaps>
+      <gap severity="medium">Whisper 2-second buffer dilutes brief speech with silence (scenario-8). Not a safety issue but reduces transcription accuracy for short utterances.</gap>
+      <gap severity="low">No automated unit tests — verification relies on runtime trace analysis and manual testing.</gap>
+    </gaps>
+    <recommendation>Module is safe for autonomous execution. Buffer dilution is a known limitation, not a blocker.</recommendation>
+  </AutonomyAssessment>
 </VerificationPlan>
