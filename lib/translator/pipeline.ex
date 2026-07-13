@@ -8,7 +8,7 @@ defmodule Translator.Pipeline do
   use GenServer
   require Logger
 
-  defstruct [:direction, :status, transcripts: [], translations: []]
+  defstruct [:direction, :status, transcripts: [], translations: [], revised_translations: []]
 
   # --- Client API ---
 
@@ -45,15 +45,28 @@ defmodule Translator.Pipeline do
   @impl true
   def handle_cast({:event, %{"event" => "transcript", "text" => text} = event}, state) do
     timestamp = Map.get(event, "timestamp", System.system_time(:millisecond))
-
     entry = %{text: text, timestamp: timestamp}
-
     Logger.debug("Pipeline #{state.direction} transcript: #{text}",
       direction: state.direction,
       pipeline: "transcript"
     )
-
     {:noreply, %{state | transcripts: [entry | state.transcripts]}}
+  end
+
+  def handle_cast({:event, %{"event" => "partial_transcript", "text" => text} = event}, state) do
+    Logger.debug("Pipeline #{state.direction} partial: #{text}",
+      direction: state.direction,
+      pipeline: "partial"
+    )
+    {:noreply, state}
+  end
+
+  def handle_cast({:event, %{"event" => "stable_partial_transcript", "text" => text} = event}, state) do
+    Logger.debug("Pipeline #{state.direction} stable: #{text}",
+      direction: state.direction,
+      pipeline: "stable"
+    )
+    {:noreply, state}
   end
 
   def handle_cast({:event, %{"event" => "translation", "text" => text} = event}, state) do
@@ -67,6 +80,19 @@ defmodule Translator.Pipeline do
     )
 
     {:noreply, %{state | translations: [entry | state.translations]}}
+  end
+
+  def handle_cast({:event, %{"event" => "translation_revised", "text" => text} = event}, state) do
+    timestamp = Map.get(event, "timestamp", System.system_time(:millisecond))
+
+    entry = %{text: text, timestamp: timestamp}
+
+    Logger.debug("Pipeline #{state.direction} revised: #{text}",
+      direction: state.direction,
+      pipeline: "translation_revised"
+    )
+
+    {:noreply, %{state | revised_translations: [entry | state.revised_translations]}}
   end
 
   def handle_cast({:event, event}, state) do
@@ -85,7 +111,8 @@ defmodule Translator.Pipeline do
       direction: state.direction,
       status: state.status,
       transcripts: Enum.reverse(state.transcripts),
-      translations: Enum.reverse(state.translations)
+      translations: Enum.reverse(state.translations),
+      revised_translations: Enum.reverse(state.revised_translations)
     }
 
     {:reply, history, state}

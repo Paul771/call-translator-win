@@ -1,8 +1,10 @@
 pub mod yandex;
 pub mod litellm;
+pub mod model;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationDirection {
@@ -58,11 +60,18 @@ pub struct TranslationEngine {
     litellm_model: String,
     provider: String,
     client: reqwest::blocking::Client,
+    yandex: Arc<std::sync::OnceLock<yandex::YandexTranslator>>,
+    litellm: Arc<std::sync::OnceLock<litellm::LiteLlmTranslator>>,
+    mt_ruen_path: String,
+    mt_enru_path: String,
+    mt_ruen: Arc<std::sync::OnceLock<model::TranslationModel>>,
+    mt_enru: Arc<std::sync::OnceLock<model::TranslationModel>>,
 }
 
 impl TranslationEngine {
     pub fn new(groq_key: &str, yandex_key: &str, yandex_folder_id: &str, provider: &str,
-               litellm_base_url: &str, litellm_api_key: &str, litellm_model: &str) -> Result<Self> {
+               litellm_base_url: &str, litellm_api_key: &str, litellm_model: &str,
+               mt_ruen_path: &str, mt_enru_path: &str) -> Result<Self> {
         eprintln!("[TRANSLATION] Provider: '{}'", provider);
         eprintln!("[TRANSLATION] Using GROQ_API_KEY: {}... (len={})",
             if groq_key.len() > 4 { &groq_key[..4] } else { "?" },
@@ -72,6 +81,8 @@ impl TranslationEngine {
             yandex_key.len());
         eprintln!("[TRANSLATION] LiteLLM: url='{}' model='{}'",
             litellm_base_url, litellm_model);
+        eprintln!("[TRANSLATION] Local MT: ru->en='{}', en->ru='{}'",
+            mt_ruen_path, mt_enru_path);
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -87,18 +98,28 @@ impl TranslationEngine {
             litellm_model: litellm_model.to_string(),
             provider: provider.to_string(),
             client,
+            yandex: Arc::new(std::sync::OnceLock::new()),
+            litellm: Arc::new(std::sync::OnceLock::new()),
+            mt_ruen_path: mt_ruen_path.to_string(),
+            mt_enru_path: mt_enru_path.to_string(),
+            mt_ruen: Arc::new(std::sync::OnceLock::new()),
+            mt_enru: Arc::new(std::sync::OnceLock::new()),
         })
     }
+    }
 
-    pub fn translate(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
+    pub fn translate(&self, text: &str, direction: &TranslationDirection) -> Result<(String, String)> {
         if text.trim().is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), "empty".into()));
         }
+
+        let provider_tag = |name: &str| name.to_string();
 
         match self.provider.as_str() {
             "groq" => {
                 if self.groq_key.len() > 4 {
-                    return self.translate_groq(text, direction);
+                    return self.translate_groq(text, direction)
+                        .map(|t| (t, provider_tag("groq")));
                 }
                 bail!("Groq selected but no valid API key")
             }
@@ -110,51 +131,116 @@ impl TranslationEngine {
             }
             "litellm" => {
                 if self.litellm_api_key.len() > 2 {
-                    return self.translate_litellm(text, direction);
+                    return self.translate_litellm(text, direction)
+                        .map(|t| (t, provider_tag("litellm")));
                 }
                 bail!("LiteLLM selected but no valid API key")
             }
-            _ => {} // "auto" — try Groq → LiteLLM → Yandex
+            "local_mt" => {
+                return self.translate_local_mt(text, direction);
+            }
+            _ => {} // "auto" — hedge all available providers, first success wins
         }
 
-        // Auto mode: try Groq first
-        if self.groq_key.len() > 4 {
-            match self.translate_groq(text, direction) {
-                Ok(result) => return Ok(result),
+        // Auto mode: launch Groq immediately, LiteLLM and Yandex with staggered start.
+        // Accept the first successful response.
+        let has_groq = self.groq_key.len() > 4;
+        let has_litellm = self.litellm_api_key.len() > 2 && !self.litellm_base_url.is_empty();
+        let has_yandex = self.yandex_key.len() > 4;
+
+        let total_tasks = has_groq as usize + has_litellm as usize + has_yandex as usize;
+        if total_tasks == 0 {
+            bail!("No valid API keys available for translation");
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Result<String>)>();
+
+        if has_groq {
+            let tx = tx.clone();
+            let s = self.clone();
+            let t = text.to_string();
+            let d = direction.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(("groq".into(), s.translate_groq(&t, &d)));
+            });
+        }
+        if has_litellm {
+            let tx = tx.clone();
+            let s = self.clone();
+            let t = text.to_string();
+            let d = direction.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let _ = tx.send(("litellm".into(), s.translate_litellm(&t, &d)));
+            });
+        }
+        if has_yandex {
+            let tx = tx.clone();
+            let s = self.clone();
+            let t = text.to_string();
+            let d = direction.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = tx.send(("yandex".into(), s.translate_yandex_raw(&t, &d)));
+            });
+        }
+        // Drop the original sender so rx.iter() terminates once all threads finish.
+        drop(tx);
+
+        let mut last_err = None;
+        for (provider, result) in rx {
+            match result {
+                Ok(translated) => {
+                    eprintln!("[AUTO] First response from {}: '{}'", provider, translated);
+                    return Ok((translated, provider));
+                }
                 Err(e) => {
-                    let err_line = format!("[FALLBACK] Groq failed: {:#}, trying LiteLLM", e);
+                    let err_line = format!("[FALLBACK] {} failed: {:#}", provider, e);
                     eprintln!("{}", err_line);
                     log_to_file("groq_debug.log", &err_line);
+                    last_err = Some(e);
                 }
             }
         }
 
-        // Fallback to LiteLLM
-        if self.litellm_api_key.len() > 2 && !self.litellm_base_url.is_empty() {
-            match self.translate_litellm(text, direction) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    let err_line = format!("[FALLBACK] LiteLLM failed: {:#}, trying Yandex", e);
-                    eprintln!("{}", err_line);
-                    log_to_file("litellm_debug.log", &err_line);
-                }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All providers failed")))
+    }
+
+    fn translate_local_mt(&self, text: &str, direction: &TranslationDirection) -> Result<(String, String)> {
+        let model = if direction.from_code == "ru" && direction.to_code == "en" {
+            &self.mt_ruen
+        } else if direction.from_code == "en" && direction.to_code == "ru" {
+            &self.mt_enru
+        } else {
+            anyhow::bail!("Local MT not available for {}→{}", direction.from_code, direction.to_code);
+        };
+
+        let mt = model.get_or_init(|| {
+            let path = if direction.from_code == "ru" {
+                &self.mt_ruen_path
+            } else {
+                &self.mt_enru_path
+            };
+            if path.is_empty() {
+                panic!("Local MT model path not configured");
             }
-        }
+            model::TranslationModel::new(std::path::Path::new(path))
+                .expect("Failed to load local MT model")
+        });
 
-        // Fallback to Yandex
-        if self.yandex_key.len() > 4 {
-            return self.translate_yandex(text, direction);
-        }
-
-        bail!("No valid API keys available for translation")
+        let result = mt.translate(text)?;
+        eprintln!("[LOCAL_MT] {}→{}: '{}' → '{}'", direction.from_code, direction.to_code, text, result);
+        Ok((result, "local_mt".into()))
     }
 
     fn translate_litellm(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
-        let translator = litellm::LiteLlmTranslator::new(
-            &self.litellm_base_url,
-            &self.litellm_api_key,
-            &self.litellm_model,
-        )?;
+        let translator = self.litellm.get_or_init(|| {
+            litellm::LiteLlmTranslator::new(
+                &self.litellm_base_url,
+                &self.litellm_api_key,
+                &self.litellm_model,
+            ).expect("LiteLLM translator init failed")
+        });
         translator.translate(text, &direction.from_code, &direction.to_code)
     }
 
@@ -271,16 +357,22 @@ impl TranslationEngine {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("GROQ all retries exhausted")))
     }
 
-    fn translate_yandex(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
-        let translator = yandex::YandexTranslator::new(&self.yandex_key, &self.yandex_folder_id)?;
-
-        let result = translator.translate(text, &direction.from_code, &direction.to_code)?;
+    fn translate_yandex(&self, text: &str, direction: &TranslationDirection) -> Result<(String, String)> {
+        let result = self.translate_yandex_raw(text, direction)?;
 
         let out_line = format!("✅ YANDEX Output: {}", result);
         eprintln!("{}", out_line);
         log_to_file("groq_debug.log", &out_line);
 
-        Ok(result)
+        Ok((result, "yandex".into()))
+    }
+
+    fn translate_yandex_raw(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
+        let translator = self.yandex.get_or_init(|| {
+            yandex::YandexTranslator::new(&self.yandex_key, &self.yandex_folder_id)
+                .expect("Yandex translator init failed")
+        });
+        translator.translate(text, &direction.from_code, &direction.to_code)
     }
 }
 

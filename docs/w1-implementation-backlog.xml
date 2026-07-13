@@ -1,0 +1,129 @@
+<ImplementationBacklog VERSION="0.1.0">
+  <Wave id="W1" name="FastLatencyRelief">
+    <goal>Reduce avoidable latency in the existing cloud-centric path without changing the visible dual-pipeline behavior.</goal>
+    <execution-packet-ref>W1-FastLatencyRelief</execution-packet-ref>
+    <verification-ref>V-LATENCY-W1</verification-ref>
+    <gate-ref>Gate-Latency-W1</gate-ref>
+
+    <ExecutionOrder>
+      <step-1>W1-C4 observability first, so every following change can be measured against baseline.</step-1>
+      <step-2>W1-C1 STT tuning second, because it is the lowest-risk direct latency reducer.</step-2>
+      <step-3>W1-C3 client reuse third, because it is a contained hot-path cleanup that reduces jitter before fallback-policy refactoring.</step-3>
+      <step-4>W1-C2 fallback-policy last, because it changes control flow and should be validated with the improved instrumentation already in place.</step-4>
+    </ExecutionOrder>
+
+    <Change id="W1-C4" type="observability" priority="highest">
+      <summary>Add or normalize stage-level latency and provider markers needed for comparison.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Ensure per-utterance metrics log `stt_ms`, `translate_ms`, `tts_ms`, and `total_ms` in a stable parseable form.</task-1>
+        <task-2>Add translation provider attribution marker such as `provider_used=...` to the accepted translation path.</task-2>
+        <task-3>Normalize emitted runtime evidence so both incoming and outgoing pipelines expose the same measurement surface.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <runtime-check>Run both pipelines and confirm metrics logs exist for incoming and outgoing paths with provider attribution.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>`pipeline_trace.log` contains parseable per-stage metrics for both directions.</item>
+        <item>The accepted translation path exposes `provider_used=...`.</item>
+      </done-when>
+    </Change>
+
+    <Change id="W1-C1" type="config-tuning" priority="high">
+      <summary>Lower Deepgram finalization delay for realtime mode.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/stt/mod.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Introduce or expose a dedicated realtime endpointing profile in Rust and Elixir runtime config.</task-1>
+        <task-2>Reduce Deepgram finalization settings for short-phrase responsiveness while preserving transcript completion.</task-2>
+        <task-3>Emit the effective endpointing settings in runtime logs so baseline and post-change runs are comparable.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <runtime-check>Capture at least 10 short-phrase samples per direction and compare `stt_final_ms` to baseline.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>`[STT] connecting ... endpointing=...ms` appears in logs.</item>
+        <item>Short-phrase p50 `stt_final_ms` improves by at least 300 ms.</item>
+        <item>Both directions still emit final transcripts reliably.</item>
+      </done-when>
+      <stop-if>
+        <item>Transcript fragmentation materially increases.</item>
+        <item>Final transcript production becomes unreliable inside the 60s autonomy window.</item>
+      </stop-if>
+    </Change>
+
+    <Change id="W1-C3" type="client-reuse" priority="medium">
+      <summary>Remove per-request HTTP client setup from translation hot paths.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/translation/yandex.rs</file>
+        <file>native/audio_engine/src/translation/mod.rs</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Refactor Yandex translation path so the HTTP client is initialized once and reused.</task-1>
+        <task-2>Review translation module constructors to avoid avoidable hot-path object churn.</task-2>
+        <task-3>Preserve the current provider behavior while reducing request setup overhead.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <runtime-check>Run repeated short-phrase translation samples and compare variance before and after the refactor.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>No per-request HTTP client construction remains on the realtime Yandex translation path.</item>
+        <item>Repeated short translations show lower cold-start variance than baseline.</item>
+      </done-when>
+    </Change>
+
+    <Change id="W1-C2" type="fallback-policy" priority="high">
+      <summary>Replace serial translation fallback with first-success wins for realtime mode.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/translation/mod.rs</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Change translation control flow so realtime mode does not wait through long serial fallback chains.</task-1>
+        <task-2>Use the first successful provider response and retain provider attribution in logs.</task-2>
+        <task-3>Keep fallback correctness visible through explicit runtime evidence and error markers.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <runtime-check>Run degraded-network or intentionally slowed-provider scenarios and compare p95 `translate_ms` against baseline.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>Slow or blocked Groq no longer delays fallback until full timeout in realtime mode.</item>
+        <item>`provider_used=...` identifies the winning provider for each accepted translation.</item>
+        <item>Degraded-network p95 `translate_ms` improves by at least 30 percent versus serial fallback baseline.</item>
+      </done-when>
+      <stop-if>
+        <item>Fallback correctness regresses.</item>
+        <item>Provider identity is lost from logs.</item>
+      </stop-if>
+    </Change>
+
+    <WaveCloseout>
+      <required-commands>
+        <command>cargo check</command>
+        <command>mix compile</command>
+      </required-commands>
+      <required-runtime-evidence>
+        <item>[STT] connecting lang=... rate=16000Hz endpointing=...ms</item>
+        <item>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</item>
+        <item>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</item>
+        <item>provider_used=...</item>
+      </required-runtime-evidence>
+      <acceptance-targets>
+        <item>Short-phrase p50 `stt_final_ms` improves by at least 300 ms.</item>
+        <item>Degraded-network p95 `translate_ms` improves by at least 30 percent.</item>
+        <item>No material regression in transcript completion reliability.</item>
+      </acceptance-targets>
+    </WaveCloseout>
+  </Wave>
+</ImplementationBacklog>

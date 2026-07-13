@@ -1,5 +1,6 @@
 mod audio;
 mod engine;
+mod pipeline;
 mod protocol;
 mod stt;
 mod tracelog;

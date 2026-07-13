@@ -37,6 +37,8 @@ pub struct EngineConfig {
     pub litellm_model: String,
     pub stt_provider: String,
     pub whisper_model: String,
+    pub local_mt_ruen: String,
+    pub local_mt_enru: String,
     pub tts_en_model: String,
     pub tts_en_config: String,
     pub tts_ru_model: String,
@@ -47,6 +49,7 @@ pub struct EngineConfig {
     pub meet_output_device: String,
     pub sample_rate: u32,
     pub endpointing_ms: u32,
+    pub utterance_end_ms: u32,
     pub my_language: String,
     pub their_language: String,
 }
@@ -90,6 +93,8 @@ impl EngineConfig {
             litellm_model: std::env::var("LITELLM_MODEL").unwrap_or_else(|_| "ollama:ministral-3:3b-cloud".into()),
             stt_provider: std::env::var("STT_PROVIDER").unwrap_or_else(|_| "auto".into()),
             whisper_model: std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "tiny".into()),
+            local_mt_ruen: std::env::var("TRANSLATOR_LOCAL_MT_RUEN").unwrap_or_default(),
+            local_mt_enru: std::env::var("TRANSLATOR_LOCAL_MT_ENRU").unwrap_or_default(),
             tts_en_model: std::env::var("TRANSLATOR_TTS_EN_MODEL")
                 .unwrap_or_else(|_| format!("{}/piper-en/en_GB-alan-low.onnx", base)),
             tts_en_config: std::env::var("TRANSLATOR_TTS_EN_CONFIG")
@@ -114,6 +119,10 @@ impl EngineConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
+            utterance_end_ms: std::env::var("TRANSLATOR_UTTERANCE_END_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500),
             my_language: std::env::var("TRANSLATOR_MY_LANG").unwrap_or_else(|_| "ru".into()),
             their_language: std::env::var("TRANSLATOR_THEIR_LANG").unwrap_or_else(|_| "en".into()),
         }
@@ -329,7 +338,7 @@ impl Engine {
 
         info!("Loading translation models...");
         let translator = Arc::new(
-            TranslationEngine::new(&self.config.groq_api_key, &self.config.yandex_api_key, &self.config.yandex_folder_id, &self.config.translation_provider, &self.config.litellm_base_url, &self.config.litellm_api_key, &self.config.litellm_model)
+            TranslationEngine::new(&self.config.groq_api_key, &self.config.yandex_api_key, &self.config.yandex_folder_id, &self.config.translation_provider, &self.config.litellm_base_url, &self.config.litellm_api_key, &self.config.litellm_model, &self.config.local_mt_ruen, &self.config.local_mt_enru)
             .context("Failed to initialize translation engine")?,
         );
 
@@ -353,6 +362,7 @@ impl Engine {
                 self.config.deepgram_api_key.clone(),
                 self.config.my_language.clone(),
                 self.config.endpointing_ms,
+                self.config.utterance_end_ms,
             );
             // Outgoing: captures from mic (Jabra), plays to CABLE Input (browser mic)
             let playback_dev = if self.config.meet_output_device.is_empty() || self.config.meet_output_device == "default" {
@@ -396,6 +406,7 @@ impl Engine {
                 self.config.deepgram_api_key.clone(),
                 self.config.their_language.clone(),
                 self.config.endpointing_ms,
+                self.config.utterance_end_ms,
             );
             let handle = spawn_pipeline(
                 "incoming",
@@ -754,12 +765,13 @@ fn run_pipeline(
         });
 
     let mut tts: Option<TtsEngine> = None;
+    let mut segmenter = crate::pipeline::segmenter::TextSegmenter::new();
+    let job_queue = crate::pipeline::job_queue::JobQueue::new();
+    let mut utterance_start: Option<Instant> = None;
 
     let _proc_echo = set_other_suppress.clone();
     let _proc_handle = std::thread::spawn(move || {
         while let Ok((text, stt_ms)) = proc_rx.recv() {
-            tracelog::trace(&proc_direction, "PROCESSOR", &format!("RECEIVED '{}' stt={}ms (suppress={})", text, stt_ms, _proc_echo.load(Ordering::SeqCst)));
-
             // Check if TTS has finished loading (non-blocking).
             if let Ok(Some(engine)) = tts_ready_rx.try_recv() {
                 tracelog::trace(&proc_direction, "TTS", "TTS engine ready, switching to full pipeline ✓");
@@ -769,9 +781,34 @@ fn run_pipeline(
                 tts = None;
             }
 
+            // Segmenter: extract only the incremental delta from stable partials
+            // to avoid retranslating the same prefix. Finals reset the segmenter.
+            let text_to_process = if let Some(delta) = segmenter.next_segment(&text) {
+                tracelog::trace(&proc_direction, "SEGMENT", &format!("delta '{}' (full: '{}')", delta, text));
+                delta
+            } else {
+                tracelog::trace(&proc_direction, "SEGMENT", &format!("no new segment in '{}'", text));
+                // Still emit the transcript event for the UI, but skip translation
+                let _ = proc_event_tx.try_send(Event::Transcript {
+                    direction: proc_direction.clone(),
+                    text: text.clone(),
+                    lang: proc_source_lang.clone(),
+                    stt_ms,
+                });
+                continue;
+            };
+
+            let job_id = job_queue.next_job();
+            tracelog::trace(&proc_direction, "PROCESSOR", &format!("JOB #{} text='{}' stt={}ms", job_id, text_to_process, stt_ms));
+
+            // Track utterance start for time-to-first-audio metric
+            if utterance_start.is_none() {
+                utterance_start = Some(Instant::now());
+            }
+
             let _audio_len = process_utterance(
                 &proc_direction,
-                &text,
+                &text_to_process,
                 stt_ms,
                 &proc_translator,
                 &translate_direction,
@@ -782,6 +819,25 @@ fn run_pipeline(
                 &proc_playback_tx,
                 &proc_event_tx,
             );
+
+            // Emit time-to-first-audio when audio is first produced for this utterance
+            if _audio_len > 0 {
+                if let Some(start) = utterance_start.take() {
+                    let first_audio_ms = start.elapsed().as_millis() as u64;
+                    tracelog::trace(&proc_direction, "METRICS", &format!("first_audio={}ms", first_audio_ms));
+                    let _ = proc_event_tx.try_send(Event::Log {
+                        level: "info".into(),
+                        message: format!("[{}] first_audio={}ms", proc_direction, first_audio_ms),
+                    });
+                }
+            }
+
+            // If this job is stale (newer job already completed), log the drop
+            if job_queue.is_stale(job_id) && _audio_len > 0 {
+                tracelog::trace(&proc_direction, "PROCESSOR", &format!("stale job #{} dropped (newer job already committed)", job_id));
+            } else {
+                job_queue.try_commit(job_id);
+            }
 
             // Echo suppression: only outgoing suppresses incoming (TTS goes to CABLE, not Jabra)
             if _audio_len > 0 && proc_direction == "outgoing" {
@@ -928,11 +984,37 @@ fn run_pipeline(
         // Non-blocking poll — returns immediately on WouldBlock
         match session.poll_transcript() {
             Ok(Some(result)) => {
-                tracelog::trace(direction, "STT", &format!("TRANSCRIPT stt={}ms text='{}'", result.stt_latency_ms, result.text));
-                if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms)) {
-                    warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
-                } else {
-                    tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
+                match result.kind {
+                    crate::stt::SttResultKind::Partial => {
+                        tracelog::trace(direction, "STT", &format!("PARTIAL text='{}'", result.text));
+                        let _ = event_tx.try_send(Event::PartialTranscript {
+                            direction: direction.to_string(),
+                            text: result.text,
+                            lang: source_lang.to_string(),
+                            stt_ms: result.stt_latency_ms,
+                        });
+                    }
+                    crate::stt::SttResultKind::StablePartial => {
+                        tracelog::trace(direction, "STT", &format!("STABLE_PARTIAL stt={}ms text='{}'", result.stt_latency_ms, result.text));
+                        let _ = event_tx.try_send(Event::StablePartialTranscript {
+                            direction: direction.to_string(),
+                            text: result.text.clone(),
+                            lang: source_lang.to_string(),
+                            stt_ms: result.stt_latency_ms,
+                        });
+                        // Stable partials also go to the processor for early translation
+                        if let Err(e) = proc_tx.try_send((result.text, result.stt_latency_ms)) {
+                            warn!("[{}] Processor channel full, dropping stable partial: {}", direction, e);
+                        }
+                    }
+                    crate::stt::SttResultKind::Final => {
+                        tracelog::trace(direction, "STT", &format!("FINAL stt={}ms text='{}'", result.stt_latency_ms, result.text));
+                        if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms)) {
+                            warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
+                        } else {
+                            tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
+                        }
+                    }
                 }
             }
             Ok(None) => {}
@@ -1008,11 +1090,11 @@ fn process_utterance(
             let _ = tx.send(result);
         });
 
-    let translated = match rx.recv_timeout(Duration::from_secs(TRANSLATE_TIMEOUT_SECS)) {
-        Ok(Ok(t)) => {
+    let (translated, provider_used) = match rx.recv_timeout(Duration::from_secs(TRANSLATE_TIMEOUT_SECS)) {
+        Ok(Ok((t, p))) => {
             let ms = translate_start.elapsed().as_millis() as u64;
-            tracelog::trace(direction, "TRANSLATE", &format!("OK {}ms result='{}'", ms, t));
-            t
+            tracelog::trace(direction, "TRANSLATE", &format!("OK {}ms provider={} result='{}'", ms, p, t));
+            (t, p)
         }
         Ok(Err(e)) => {
             let ms = translate_start.elapsed().as_millis() as u64;
@@ -1142,9 +1224,11 @@ fn process_utterance(
         stt_ms,
         translate_ms,
         tts_ms,
+        provider_used: Some(provider_used.clone()),
+        time_to_first_audio_ms: None,
     });
-    tracelog::trace(direction, "METRICS", &format!("stt={}ms translate={}ms tts={}ms total={}ms",
-        stt_ms, translate_ms, tts_ms, stt_ms + translate_ms + tts_ms));
+    tracelog::trace(direction, "METRICS", &format!("stt={}ms translate={}ms tts={}ms total={}ms provider={}",
+        stt_ms, translate_ms, tts_ms, stt_ms + translate_ms + tts_ms, provider_used));
 
     audio_len
 }

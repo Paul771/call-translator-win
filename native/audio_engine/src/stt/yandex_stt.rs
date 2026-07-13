@@ -121,6 +121,7 @@ impl YandexSttSession {
                     Ok(Some(super::SttResult {
                         text,
                         stt_latency_ms: latency_ms,
+                        kind: super::SttResultKind::Final,
                     }))
                 } else {
                     Ok(None)

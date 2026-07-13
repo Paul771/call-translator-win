@@ -1,0 +1,144 @@
+<ImplementationBacklog VERSION="0.1.0">
+  <Wave id="W2" name="LocalFirstCriticalPath">
+    <goal>Move the ru/en critical path to a local-first path for STT, translation, and audio response while preserving the existing dual-pipeline behavior.</goal>
+    <verification-ref>V-LATENCY-W2</verification-ref>
+    <gate-ref>Gate-Latency-W2</gate-ref>
+
+    <ExecutionOrder>
+      <step-1>W2-C1 persistent local STT worker first, because local-first execution cannot exist until per-request Whisper fallback is replaced.</step-1>
+      <step-2>W2-C2 local translation provider second, because the local critical path needs both STT and translation before path separation can be validated.</step-2>
+      <step-3>W2-C3 fast-path versus quality-path separation third, because it depends on the local STT and local MT path already existing.</step-3>
+      <step-4>W2-C4 preset support last, because UI and saved-config exposure should be built on top of the verified runtime path rather than before it.</step-4>
+    </ExecutionOrder>
+
+    <Change id="W2-C1" type="persistent-worker" priority="highest">
+      <summary>Replace per-request Whisper subprocess execution with a persistent local STT worker.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/stt/whisper_stt.rs</file>
+        <file>native/audio_engine/src/stt/mod.rs</file>
+        <file>worker runtime file to be introduced during implementation</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Remove the temp WAV roundtrip and per-utterance `pythonw.exe` launch from the local STT path.</task-1>
+        <task-2>Introduce a long-lived local STT worker process or runtime that keeps the model loaded across utterances.</task-2>
+        <task-3>Adapt the Rust STT integration so local STT can act as a primary provider, not only as a terminal fallback.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <runtime-check>Run the ru/en path with local STT selected and confirm transcript events are produced without Deepgram connectivity.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>The local STT hot path no longer writes temp WAV files for each utterance.</item>
+        <item>The local STT hot path no longer launches `pythonw.exe` once per utterance.</item>
+        <item>Transcript generation works with no Deepgram dependency on the active path.</item>
+      </done-when>
+      <stop-if>
+        <item>Persistent worker behavior requires a contract-level change to transcript semantics.</item>
+        <item>Local STT startup or shutdown breaks the pipeline lifecycle in both directions.</item>
+      </stop-if>
+    </Change>
+
+    <Change id="W2-C2" type="provider-integration" priority="high">
+      <summary>Integrate the existing CTranslate2 wrapper as a first-class local translation provider.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/translation/model.rs</file>
+        <file>native/audio_engine/src/translation/mod.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Wire the existing local translation wrapper into `TranslationEngine` as a selectable provider for `ru&lt;-&gt;en`.</task-1>
+        <task-2>Ensure local translation model loading is compatible with engine startup and runtime configuration.</task-2>
+        <task-3>Add clear provider attribution so accepted translations can be identified as `local_mt` in runtime logs.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <runtime-check>Run local-only ru/en translation and verify translation events occur without Groq, LiteLLM, or Yandex on the hot path.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>`ru&lt;-&gt;en` translation succeeds through the local provider.</item>
+        <item>`provider_used=local_mt` appears in runtime evidence.</item>
+        <item>Short-phrase translation variance is lower than the cloud fallback baseline.</item>
+      </done-when>
+      <stop-if>
+        <item>Local translation requires hidden cloud fallback to stay functional.</item>
+        <item>Model integration destabilizes startup of both pipelines.</item>
+      </stop-if>
+    </Change>
+
+    <Change id="W2-C3" type="path-separation" priority="high">
+      <summary>Separate the fast local audio path from optional cloud-based correction or quality paths.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+        <file>lib/translator/pipeline.ex</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Make the fast local path authoritative for transcript-to-audio flow.</task-1>
+        <task-2>Prevent cloud correction or quality work from blocking playback on the local path.</task-2>
+        <task-3>Extend runtime event handling so live translation and revised translation can coexist without UI ambiguity.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <runtime-check>Verify that audio output still occurs when cloud correction is unavailable or disabled.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>Audio output is produced from the local fast path without waiting for cloud correction.</item>
+        <item>Pipeline state can represent live and revised translation independently.</item>
+      </done-when>
+      <stop-if>
+        <item>Separation breaks the current event contract for transcript or translation delivery.</item>
+        <item>Playback becomes dependent on optional correction logic.</item>
+      </stop-if>
+    </Change>
+
+    <Change id="W2-C4" type="preset-support" priority="medium">
+      <summary>Add configuration and UI support for a Russia-oriented local-first preset.</summary>
+      <write-scope>
+        <file>lib/translator/config.ex</file>
+        <file>web/routes.py</file>
+        <file>web/templates/index.html</file>
+        <file>web/static/js/app.js</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Define a preset that selects local STT, local MT, and aggressive realtime thresholds.</task-1>
+        <task-2>Persist preset selection through the existing settings flow.</task-2>
+        <task-3>Expose the preset clearly in the UI without hiding advanced controls.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>mix compile</command>
+        <runtime-check>Change to the preset through the UI or settings path, restart the engine, and verify the expected local-first configuration is active.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>A single preset enables the local-first ru/en path.</item>
+        <item>Preset selection survives restart through saved settings.</item>
+      </done-when>
+    </Change>
+
+    <WaveCloseout>
+      <required-commands>
+        <command>cargo check</command>
+        <command>mix compile</command>
+      </required-commands>
+      <required-runtime-evidence>
+        <item>[outgoing] STT TRANSCRIPT stt=Nms text='...'</item>
+        <item>[incoming] STT TRANSCRIPT stt=Nms text='...'</item>
+        <item>provider_used=local_mt</item>
+        <item>[outgoing] TTS OK Nms samples=N</item>
+        <item>[incoming] TTS OK Nms samples=N</item>
+      </required-runtime-evidence>
+      <acceptance-targets>
+        <item>ru/en hot path uses `local_mt` instead of Groq, LiteLLM, or Yandex.</item>
+        <item>Short-phrase translation variance is lower than the cloud fallback baseline.</item>
+        <item>p50 total latency approaches the local-path target without requiring external API availability.</item>
+      </acceptance-targets>
+      <baseline-scenarios>
+        <scenario>ShortPhraseOutgoingRUEN</scenario>
+        <scenario>ShortPhraseIncomingENRU</scenario>
+        <scenario>DegradedNetworkFallback</scenario>
+      </baseline-scenarios>
+    </WaveCloseout>
+  </Wave>
+</ImplementationBacklog>

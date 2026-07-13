@@ -28,16 +28,17 @@ pub struct DeepgramStt {
     api_key: String,
     language: String,
     endpointing_ms: u32,
+    utterance_end_ms: u32,
 }
 
 impl DeepgramStt {
-    pub fn new(api_key: String, language: String, endpointing_ms: u32) -> Self {
+    pub fn new(api_key: String, language: String, endpointing_ms: u32, utterance_end_ms: u32) -> Self {
         let language = match language.as_str() {
             "pt" => "pt-BR",
             "no" => "nb",
             code => code,
         }.to_string();
-        Self { api_key, language, endpointing_ms }
+        Self { api_key, language, endpointing_ms, utterance_end_ms }
     }
 
     pub fn create_session(&self, sample_rate: u32) -> Result<DeepgramSession> {
@@ -51,9 +52,9 @@ impl DeepgramStt {
                  &multichannel=false\
                  &interim_results=true\
                  &endpointing={}\
-                 &utterance_end_ms=1500\
+                 &utterance_end_ms={}\
                  &vad_events=true",
-                sample_rate, self.endpointing_ms
+                sample_rate, self.endpointing_ms, self.utterance_end_ms
             )
         } else {
             format!(
@@ -66,14 +67,14 @@ impl DeepgramStt {
                  &multichannel=false\
                  &interim_results=true\
                  &endpointing={}\
-                 &utterance_end_ms=1500\
+                 &utterance_end_ms={}\
                  &vad_events=true",
-                self.language, sample_rate, self.endpointing_ms
+                self.language, sample_rate, self.endpointing_ms, self.utterance_end_ms
             )
         };
 
-        tracelog::trace("stt", "STT", &format!("connecting lang={} rate={}Hz endpointing={}ms",
-            self.language, sample_rate, self.endpointing_ms));
+        tracelog::trace("stt", "STT", &format!("connecting lang={} rate={}Hz endpointing={}ms utterance_end={}ms",
+            self.language, sample_rate, self.endpointing_ms, self.utterance_end_ms));
 
         let mut request = url_str
             .into_client_request()
@@ -86,10 +87,10 @@ impl DeepgramStt {
         );
 
         info!(
-            "Connecting to Deepgram (lang={}, {}Hz, endpointing={}ms)...",
-            self.language, sample_rate, self.endpointing_ms
+            "Connecting to Deepgram (lang={}, {}Hz, endpointing={}ms, utterance_end={}ms)...",
+            self.language, sample_rate, self.endpointing_ms, self.utterance_end_ms
         );
-        log_file(&format!("connecting lang={} rate={} endpointing={}ms", self.language, sample_rate, self.endpointing_ms));
+        log_file(&format!("connecting lang={} rate={} endpointing={}ms utterance_end={}ms", self.language, sample_rate, self.endpointing_ms, self.utterance_end_ms));
 
         let (connect_tx, connect_rx) = std::sync::mpsc::channel();
         let connect_timeout = Duration::from_secs(15);
@@ -121,11 +122,14 @@ impl DeepgramStt {
             last_send_time: Instant::now(),
             sample_rate,
             pending_audio: Vec::new(),
+            last_interim: None,
+            interim_stability: 0,
         })
     }
 }
 
 const MAX_PENDING_AUDIO: usize = 65536;
+const STABLE_PARTIAL_THRESHOLD: u32 = 3;
 
 pub struct DeepgramSession {
     ws: WebSocket<MaybeTlsStream<std::net::TcpStream>>,
@@ -133,11 +137,21 @@ pub struct DeepgramSession {
     #[allow(dead_code)]
     sample_rate: u32,
     pending_audio: Vec<u8>,
+    last_interim: Option<String>,
+    interim_stability: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SttResultKind {
+    Partial,
+    StablePartial,
+    Final,
 }
 
 pub struct SttResult {
     pub text: String,
     pub stt_latency_ms: u64,
+    pub kind: SttResultKind,
 }
 
 impl DeepgramSession {
@@ -215,14 +229,32 @@ impl DeepgramSession {
                                 .to_string();
                             let is_final = resp.is_final == Some(true);
                             if is_final && !transcript.trim().is_empty() {
+                                self.last_interim = None;
+                                self.interim_stability = 0;
                                 let since_last = self.last_send_time.elapsed().as_millis() as u64;
                                 tracelog::trace("stt", "STT", &format!("FINAL stt={}ms text='{}'", since_last, transcript));
-                                return Ok(Some(SttResult { text: transcript, stt_latency_ms: since_last }));
+                                return Ok(Some(SttResult { text: transcript, stt_latency_ms: since_last, kind: SttResultKind::Final }));
                             } else if is_final {
+                                self.last_interim = None;
+                                self.interim_stability = 0;
                                 return Ok(None);
                             } else {
                                 if !transcript.trim().is_empty() {
                                     tracelog::trace("stt", "STT", &format!("interim: '{}'", transcript));
+                                    let same = self.last_interim.as_deref() == Some(&transcript);
+                                    if same {
+                                        self.interim_stability += 1;
+                                    } else {
+                                        self.interim_stability = 1;
+                                    }
+                                    self.last_interim = Some(transcript.clone());
+                                    let kind = if self.interim_stability >= STABLE_PARTIAL_THRESHOLD {
+                                        SttResultKind::StablePartial
+                                    } else {
+                                        SttResultKind::Partial
+                                    };
+                                    let since_last = self.last_send_time.elapsed().as_millis() as u64;
+                                    return Ok(Some(SttResult { text: transcript, stt_latency_ms: since_last, kind }));
                                 }
                             }
                         }
@@ -321,7 +353,8 @@ impl UnifiedSttSession {
     pub fn close(&mut self) {
         match self {
             Self::Deepgram(s) => s.close(),
-            Self::Yandex(_) | Self::Whisper(_) => {},
+            Self::Yandex(_) => {},
+            Self::Whisper(s) => s.close(),
         }
     }
 }

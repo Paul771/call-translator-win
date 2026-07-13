@@ -1,0 +1,237 @@
+<GraceFixPlan VERSION="0.1.0">
+  <Context>
+    <issue-id>LATENCY-RF-001</issue-id>
+    <title>Pipeline latency and provider instability in Russia-region deployments</title>
+    <problem-summary>Current STT and translation providers do not reliably achieve sub-second latency. Deepgram and Groq are unstable from Russia. Yandex STT/Translate and local LiteLLM are more reachable but too slow on the current critical path.</problem-summary>
+    <user-goal>Reach a stable low-latency bidirectional pipeline, prioritizing local-first execution for ru&lt;-&gt;en while preserving the current dual-pipeline UX.</user-goal>
+  </Context>
+
+  <Locate>
+    <knowledge-graph-ref>docs/knowledge-graph.xml</knowledge-graph-ref>
+    <verification-plan-ref>docs/verification-plan.xml</verification-plan-ref>
+    <operational-packets-ref>docs/operational-packets.xml</operational-packets-ref>
+    <affected-modules>
+      <module id="M-STT" path="native/audio_engine/src/stt/">Deepgram primary STT, Yandex fallback, local Whisper fallback</module>
+      <module id="M-TRANSLATION" path="native/audio_engine/src/translation/">Groq, LiteLLM, Yandex translation chain, plus existing CTranslate2 wrapper in model.rs</module>
+      <module id="M-ENGINE" path="native/audio_engine/src/engine.rs">Critical path orchestration, timeouts, queueing, transcript-to-translation handoff</module>
+      <module id="M-ELIXIR" path="lib/translator/audio_engine.ex">Runtime config injection and telemetry routing</module>
+      <module id="M-WEB" path="web/">Future preset exposure and latency observability</module>
+    </affected-modules>
+    <failure-packets>
+      <packet-ref>Deepgram WS drops every ~20s (error 10054)</packet-ref>
+      <packet-ref>Translation timeout and serial fallback amplification on slow networks</packet-ref>
+    </failure-packets>
+  </Locate>
+
+  <Analysis>
+    <finding id="F-1">Deepgram final transcript latency is inflated by finalization settings such as endpointing and utterance_end_ms, which delays downstream translation even when speech is already complete.</finding>
+    <finding id="F-2">Yandex STT and local Whisper fallback are batch-oriented in the current implementation, so they cannot reliably meet a sub-second target without architectural changes.</finding>
+    <finding id="F-3">Translation fallback is serial on the hot path. A slow or blocked provider increases tail latency before the next provider is even tried.</finding>
+    <finding id="F-4">Local translation capability is already partially present in `native/audio_engine/src/translation/model.rs`, but it is not integrated into `TranslationEngine` as a first-class provider.</finding>
+    <finding id="F-5">The current processor model waits for final STT output before translation and TTS, so the pipeline does not yet benefit from partial or stable-partial overlap.</finding>
+  </Analysis>
+
+  <PlanWaves>
+    <Wave id="W1" name="FastLatencyRelief" priority="high">
+      <goal>Reduce avoidable latency in the existing cloud-centric path without changing the user-visible architecture.</goal>
+      <target-modules>M-STT, M-TRANSLATION, M-ENGINE, M-ELIXIR</target-modules>
+      <changes>
+        <change id="W1-C1" type="config-tuning">
+          <summary>Lower Deepgram finalization delays for realtime mode.</summary>
+          <files>
+            <file>native/audio_engine/src/stt/mod.rs</file>
+            <file>native/audio_engine/src/engine.rs</file>
+            <file>lib/translator/audio_engine.ex</file>
+          </files>
+          <acceptance>
+            <item>`pipeline_trace.log` shows updated realtime endpointing settings.</item>
+            <item>Short phrase `stt_final_ms` improves versus baseline by at least 300 ms.</item>
+            <item>No loss of final transcript production in both directions during smoke test.</item>
+          </acceptance>
+        </change>
+        <change id="W1-C2" type="fallback-policy">
+          <summary>Replace serial translation fallback with fastest-success policy for realtime mode.</summary>
+          <files>
+            <file>native/audio_engine/src/translation/mod.rs</file>
+          </files>
+          <acceptance>
+            <item>Slow or blocked Groq no longer delays fallback until full timeout.</item>
+            <item>Logs expose the winning provider for each translation.</item>
+            <item>`p95 translate_ms` drops by at least 30 percent on degraded-network tests.</item>
+          </acceptance>
+        </change>
+        <change id="W1-C3" type="client-reuse">
+          <summary>Remove per-request HTTP client construction from translation hot paths.</summary>
+          <files>
+            <file>native/audio_engine/src/translation/yandex.rs</file>
+            <file>native/audio_engine/src/translation/mod.rs</file>
+          </files>
+          <acceptance>
+            <item>No per-request `Client::builder()` remains on the realtime translation path.</item>
+            <item>Repeated short translations show reduced cold-start variance.</item>
+          </acceptance>
+        </change>
+        <change id="W1-C4" type="observability">
+          <summary>Add stage-level latency markers needed to compare pre/post optimization.</summary>
+          <files>
+            <file>native/audio_engine/src/engine.rs</file>
+            <file>lib/translator/audio_engine.ex</file>
+          </files>
+          <acceptance>
+            <item>Each completed utterance records `stt_ms`, `translate_ms`, `tts_ms`, `total_ms`, and `provider_used`.</item>
+            <item>The logs support p50 and p95 calculations by stage.</item>
+          </acceptance>
+        </change>
+      </changes>
+      <verification>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <evidence>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</evidence>
+        <evidence>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</evidence>
+      </verification>
+    </Wave>
+
+    <Wave id="W2" name="LocalFirstCriticalPath" priority="high">
+      <goal>Move STT and translation off unstable external services for the ru&lt;-&gt;en critical path while preserving the current dual-pipeline flow.</goal>
+      <target-modules>M-STT, M-TRANSLATION, M-ENGINE, M-ELIXIR, M-WEB</target-modules>
+      <changes>
+        <change id="W2-C1" type="persistent-worker">
+          <summary>Replace per-request Whisper subprocess execution with a persistent local STT worker.</summary>
+          <files>
+            <file>native/audio_engine/src/stt/whisper_stt.rs</file>
+            <file>native/audio_engine/src/stt/mod.rs</file>
+            <file>scripts/ or worker runtime file to be introduced during implementation</file>
+          </files>
+          <acceptance>
+            <item>No temp WAV file roundtrip remains in the local STT hot path.</item>
+            <item>No per-utterance `pythonw.exe` process launch remains for local STT.</item>
+            <item>Local STT can operate as a primary provider without contacting Deepgram.</item>
+          </acceptance>
+        </change>
+        <change id="W2-C2" type="provider-integration">
+          <summary>Integrate the existing CTranslate2 translation wrapper as a first-class local provider.</summary>
+          <files>
+            <file>native/audio_engine/src/translation/model.rs</file>
+            <file>native/audio_engine/src/translation/mod.rs</file>
+            <file>native/audio_engine/src/engine.rs</file>
+            <file>lib/translator/audio_engine.ex</file>
+          </files>
+          <acceptance>
+            <item>`ru&lt;-&gt;en` translation works in a local-only mode with no Groq, LiteLLM, or Yandex dependency on the hot path.</item>
+            <item>Translation provider logs clearly distinguish `local_mt` from cloud providers.</item>
+            <item>Short-phrase `translate_ms` is lower and more stable than the cloud fallback baseline.</item>
+          </acceptance>
+        </change>
+        <change id="W2-C3" type="path-separation">
+          <summary>Separate fast audio path from optional quality or correction path.</summary>
+          <files>
+            <file>native/audio_engine/src/engine.rs</file>
+            <file>lib/translator/audio_engine.ex</file>
+            <file>lib/translator/pipeline.ex</file>
+          </files>
+          <acceptance>
+            <item>Audio output is produced from the fast local path without waiting for cloud correction.</item>
+            <item>UI state can show a live translation and a revised translation independently.</item>
+          </acceptance>
+        </change>
+        <change id="W2-C4" type="preset-support">
+          <summary>Add configuration support for a Russia-oriented local-first preset.</summary>
+          <files>
+            <file>lib/translator/config.ex</file>
+            <file>web/routes.py</file>
+            <file>web/templates/index.html</file>
+            <file>web/static/js/app.js</file>
+          </files>
+          <acceptance>
+            <item>A single preset enables local STT, local MT, and aggressive realtime thresholds.</item>
+            <item>Restarting the engine from saved settings preserves the preset selection.</item>
+          </acceptance>
+        </change>
+      </changes>
+      <verification>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <evidence>Both pipelines run in local-only mode.</evidence>
+        <evidence>Local STT and local MT generate transcript and translation events without external API availability.</evidence>
+      </verification>
+    </Wave>
+
+    <Wave id="W3" name="IncrementalStreamingArchitecture" priority="medium">
+      <goal>Reach a stable sub-second experience by overlapping STT, translation, and playback on stable partials instead of full-utterance boundaries.</goal>
+      <target-modules>M-STT, M-TRANSLATION, M-ENGINE, M-TTS, M-WEB</target-modules>
+      <changes>
+        <change id="W3-C1" type="incremental-stt">
+          <summary>Emit partial and stable-partial transcript events from the STT layer.</summary>
+          <files>
+            <file>native/audio_engine/src/stt/mod.rs</file>
+            <file>native/audio_engine/src/engine.rs</file>
+            <file>lib/translator/audio_engine.ex</file>
+            <file>lib/translator/pipeline.ex</file>
+            <file>web/static/js/app.js</file>
+          </files>
+          <acceptance>
+            <item>Stable partials reach the UI before final transcript completion.</item>
+            <item>Final transcripts remain backward-compatible with the current event flow.</item>
+          </acceptance>
+        </change>
+        <change id="W3-C2" type="segmenter-and-queueing">
+          <summary>Add text segment stabilization and stale-job cancellation.</summary>
+          <files>
+            <file>native/audio_engine/src/engine.rs</file>
+            <file>native/audio_engine/src/pipeline/segmenter.rs</file>
+            <file>native/audio_engine/src/pipeline/job_queue.rs</file>
+          </files>
+          <acceptance>
+            <item>Repeated partial prefixes are not retranslated unnecessarily.</item>
+            <item>Stale translation and TTS jobs are canceled or dropped with explicit log markers.</item>
+          </acceptance>
+        </change>
+        <change id="W3-C3" type="incremental-tts">
+          <summary>Allow early playback from confirmed translated segments instead of waiting for full utterance completion.</summary>
+          <files>
+            <file>native/audio_engine/src/tts/mod.rs</file>
+            <file>native/audio_engine/src/tts/scheduler.rs</file>
+            <file>native/audio_engine/src/engine.rs</file>
+          </files>
+          <acceptance>
+            <item>`time_to_first_audio_ms` is logged and measured separately from total utterance time.</item>
+            <item>Users hear the beginning of the translation before the source speaker finishes long sentences.</item>
+          </acceptance>
+        </change>
+      </changes>
+      <verification>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <evidence>Stable partial transcript markers appear before final transcript markers.</evidence>
+        <evidence>Playback starts before full-utterance translation completion on long test sentences.</evidence>
+      </verification>
+    </Wave>
+  </PlanWaves>
+
+  <OpenDecisions>
+    <decision id="D-1">Whether local STT should be implemented with faster-whisper, whisper.cpp, or another persistent runtime.</decision>
+    <decision id="D-2">Whether the existing CTranslate2 wrapper should be the default local MT backend or remain one of several options.</decision>
+    <decision id="D-3">Whether partial-translation audio should be enabled immediately or gated behind a feature flag until correction behavior is validated.</decision>
+  </OpenDecisions>
+
+  <VerificationStrategy>
+    <baseline-metrics>
+      <metric>stt_final_ms</metric>
+      <metric>translate_ms</metric>
+      <metric>tts_ms</metric>
+      <metric>total_ms</metric>
+      <metric>provider_used</metric>
+      <metric>time_to_first_audio_ms</metric>
+    </baseline-metrics>
+    <acceptance-targets>
+      <target wave="W1">Improve cloud-path tail latency without reducing pipeline stability.</target>
+      <target wave="W2">Achieve full local-only ru&lt;-&gt;en pipeline functionality.</target>
+      <target wave="W3">Approach a consistent sub-second user-perceived response on short phrases and early-audio response on longer phrases.</target>
+    </acceptance-targets>
+  </VerificationStrategy>
+
+  <Notes>
+    <note>This document is planning-only. It does not change module contracts or claim implemented behavior.</note>
+    <note>When implementation begins, update `docs/development-plan.xml`, `docs/verification-plan.xml`, and `docs/knowledge-graph.xml` only for the waves that are actually executed.</note>
+  </Notes>
+</GraceFixPlan>
