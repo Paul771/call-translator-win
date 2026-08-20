@@ -5,6 +5,11 @@
     <risk-1>Deepgram WS instability (error 10054) causes STT gaps. Mitigated by Whisper fallback.</risk-1>
     <risk-2>WASAPI COM references from device enumeration can block pipeline audio capture.</risk-2>
     <risk-3>Echo feedback through CABLE if meeting app misconfigured (speaker must be CABLE Input).</risk-3>
+    <risk-4>Current Yandex STT and Whisper fallback paths are batch-oriented and cannot reliably meet sub-second response targets.</risk-4>
+    <risk-5>Serial translation fallback amplifies tail latency when Groq or LiteLLM are slow or unreachable from Russia.</risk-5>
+    <strategy-1>Introduce a low-latency realtime profile that reduces STT finalization delays and removes long retry pauses from the hot path.</strategy-1>
+    <strategy-2>Adopt a local-first critical path for ru/en using persistent local STT and local machine translation, while keeping cloud providers as optional fallback or quality lanes.</strategy-2>
+    <strategy-3>Move from final-utterance processing toward stable-partial and incremental playback to approach sub-second perceived latency.</strategy-3>
   </ArchitectureNotes>
 
   <Modules>
@@ -199,4 +204,71 @@
       <evidence>pipeline_trace.log: Switching to Yandex/Whisper STT messages</evidence>
     </DF-FALLBACK>
   </DataFlow>
+
+  <PlannedWaves>
+    <Wave id="W1" NAME="FastLatencyRelief" STATUS="planned" PRIORITY="high">
+      <goal>Reduce avoidable latency in the current cloud-centric pipeline without changing the visible product flow.</goal>
+      <scope>M-STT, M-TRANSLATION, M-ENGINE, M-ELIXIR</scope>
+      <changes>
+        <change-1>Lower Deepgram realtime endpointing and utterance finalization delay for short phrases.</change-1>
+        <change-2>Replace serial translation fallback with fastest-success behavior in realtime mode.</change-2>
+        <change-3>Remove long retry backoff and per-request HTTP client setup from the translation hot path.</change-3>
+        <change-4>Add stage-level latency metrics and provider markers needed for before/after comparison.</change-4>
+      </changes>
+      <target-files>
+        <file>native/audio_engine/src/stt/mod.rs</file>
+        <file>native/audio_engine/src/translation/mod.rs</file>
+        <file>native/audio_engine/src/translation/yandex.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+      </target-files>
+      <verification-ref>V-LATENCY-W1</verification-ref>
+    </Wave>
+
+    <Wave id="W2" NAME="LocalFirstCriticalPath" STATUS="planned" PRIORITY="high">
+      <goal>Move the ru/en critical path off unstable external providers while preserving the current dual-pipeline behavior.</goal>
+      <scope>M-STT, M-TRANSLATION, M-ENGINE, M-ELIXIR, M-WEB</scope>
+      <changes>
+        <change-1>Replace per-request Whisper fallback with a persistent local STT worker.</change-1>
+        <change-2>Integrate the existing CTranslate2 wrapper as a first-class local translation provider.</change-2>
+        <change-3>Separate the fast audio path from optional cloud-based correction or quality paths.</change-3>
+        <change-4>Add a local-first Russia-oriented preset in runtime configuration and UI.</change-4>
+      </changes>
+      <target-files>
+        <file>native/audio_engine/src/stt/whisper_stt.rs</file>
+        <file>native/audio_engine/src/stt/mod.rs</file>
+        <file>native/audio_engine/src/translation/model.rs</file>
+        <file>native/audio_engine/src/translation/mod.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+        <file>lib/translator/config.ex</file>
+        <file>web/routes.py</file>
+        <file>web/static/js/app.js</file>
+        <file>web/templates/index.html</file>
+      </target-files>
+      <verification-ref>V-LATENCY-W2</verification-ref>
+    </Wave>
+
+    <Wave id="W3" NAME="IncrementalStreamingArchitecture" STATUS="planned" PRIORITY="medium">
+      <goal>Reach sub-second perceived latency by overlapping STT, translation, TTS, and playback on stable partials.</goal>
+      <scope>M-STT, M-TRANSLATION, M-ENGINE, M-TTS, M-WEB</scope>
+      <changes>
+        <change-1>Emit partial and stable-partial transcript events from the STT layer.</change-1>
+        <change-2>Add text-segment stabilization and stale-job cancellation in the engine.</change-2>
+        <change-3>Support early playback from confirmed translated segments instead of waiting for full utterance completion.</change-3>
+      </changes>
+      <target-files>
+        <file>native/audio_engine/src/stt/mod.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>native/audio_engine/src/pipeline/segmenter.rs</file>
+        <file>native/audio_engine/src/pipeline/job_queue.rs</file>
+        <file>native/audio_engine/src/tts/mod.rs</file>
+        <file>native/audio_engine/src/tts/scheduler.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+        <file>lib/translator/pipeline.ex</file>
+        <file>web/static/js/app.js</file>
+      </target-files>
+      <verification-ref>V-LATENCY-W3</verification-ref>
+    </Wave>
+  </PlannedWaves>
 </DevelopmentPlan>

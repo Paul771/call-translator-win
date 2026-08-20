@@ -287,15 +287,26 @@ defp open_port do
             {~c"TRANSLATOR_SPEAKER_DEVICE", String.to_charlist(Map.get(settings, "speaker_device", "default"))},
             {~c"TRANSLATOR_MEET_INPUT", String.to_charlist(Map.get(settings, "meet_input_device", "CABLE Output (VB-Audio Virtual Cable)"))},
             {~c"TRANSLATOR_MEET_OUTPUT", String.to_charlist(Map.get(settings, "meet_output_device", "CABLE Input (VB-Audio Virtual Cable)"))},
-            {~c"TRANSLATOR_ENDPOINTING_MS", String.to_charlist("#{Map.get(settings, "endpointing_ms", 300)}")},
+
+            # Apply local-first preset override before building env vars.
+            local_first? = Map.get(settings, "local_first", false)
+            stt_provider = if local_first?, do: "whisper", else: Map.get(settings, "stt_provider", "auto")
+            translation_provider = if local_first?, do: "local_mt", else: Map.get(settings, "translation_provider", "auto")
+            endpointing_ms = if local_first?, do: 150, else: Map.get(settings, "endpointing_ms", 300)
+            utterance_end_ms = if local_first?, do: 400, else: Map.get(settings, "utterance_end_ms", 500)
+
+            {~c"TRANSLATOR_ENDPOINTING_MS", String.to_charlist("#{endpointing_ms}")},
+            {~c"TRANSLATOR_UTTERANCE_END_MS", String.to_charlist("#{utterance_end_ms}")},
             {~c"TRANSLATOR_MY_LANG", String.to_charlist(Map.get(settings, "my_language", "ru"))},
             {~c"TRANSLATOR_THEIR_LANG", String.to_charlist(Map.get(settings, "their_language", "en"))},
-            {~c"TRANSLATOR_PROVIDER", String.to_charlist(Map.get(settings, "translation_provider", "auto"))},
+            {~c"TRANSLATOR_PROVIDER", String.to_charlist(translation_provider)},
             {~c"LITELLM_BASE_URL", String.to_charlist(Map.get(settings, "litellm_base_url", ""))},
             {~c"LITELLM_API_KEY", String.to_charlist(Map.get(settings, "litellm_api_key", ""))},
             {~c"LITELLM_MODEL", String.to_charlist(Map.get(settings, "litellm_model", "ollama:ministral-3:3b-cloud"))},
-            {~c"STT_PROVIDER", String.to_charlist(Map.get(settings, "stt_provider", "auto"))},
-            {~c"WHISPER_MODEL", String.to_charlist(Map.get(settings, "whisper_model", "tiny"))}
+            {~c"STT_PROVIDER", String.to_charlist(stt_provider)},
+            {~c"WHISPER_MODEL", String.to_charlist(Map.get(settings, "whisper_model", "tiny"))},
+            {~c"TRANSLATOR_LOCAL_MT_RUEN", String.to_charlist(Map.get(settings, "local_mt_ruen_path", ""))},
+            {~c"TRANSLATOR_LOCAL_MT_ENRU", String.to_charlist(Map.get(settings, "local_mt_enru_path", ""))}
           ]}
         ])
 
@@ -401,6 +412,28 @@ defp open_port do
   end
 
   defp dispatch_event(
+         %{"event" => "partial_transcript", "direction" => direction, "text" => text, "stt_ms" => stt_ms} = event,
+         state
+       ) do
+    line = "[STT] [#{direction}] PARTIAL #{text} (#{stt_ms}ms)"
+    Logger.info(line)
+    log_to_file(line)
+    notify_pipeline(direction, event)
+    state
+  end
+
+  defp dispatch_event(
+         %{"event" => "stable_partial_transcript", "direction" => direction, "text" => text, "stt_ms" => stt_ms} = event,
+         state
+       ) do
+    line = "[STT] [#{direction}] STABLE #{text} (#{stt_ms}ms)"
+    Logger.info(line)
+    log_to_file(line)
+    notify_pipeline(direction, event)
+    state
+  end
+
+  defp dispatch_event(
          %{"event" => "transcript", "direction" => direction, "text" => text, "stt_ms" => stt_ms} = event,
          state
        ) do
@@ -426,11 +459,28 @@ defp open_port do
     state
   end
 
-  defp dispatch_event(%{"event" => "metrics", "direction" => direction, "stt_ms" => stt, "translate_ms" => trl, "tts_ms" => tts} = event, state) do
-    total = stt + trl + tts
-    line = "[TOTAL] [#{direction}] stt=#{stt}ms trl=#{trl}ms tts=#{tts}ms total=#{total}ms"
+  defp dispatch_event(
+         %{"event" => "translation_revised", "direction" => direction, "text" => text, "translate_ms" => translate_ms} = event,
+         state
+       ) do
+    line = "[TR-rev] [#{direction}] #{text} (#{translate_ms}ms)"
     Logger.info(line)
     log_to_file(line)
+    notify_pipeline(direction, event)
+    state
+  end
+
+  defp dispatch_event(%{"event" => "metrics", "direction" => direction, "stt_ms" => stt, "translate_ms" => trl, "tts_ms" => tts} = event, state) do
+    total = stt + trl + tts
+    provider = Map.get(event, "provider_used", "unknown")
+    line = "[TOTAL] [#{direction}] stt=#{stt}ms trl=#{trl}ms tts=#{tts}ms total=#{total}ms provider=#{provider}"
+    Logger.info(line)
+    log_to_file(line)
+    # Also log first-audio metric when present alongside engine-side tracelog
+    case Map.get(event, "time_to_first_audio_ms") do
+      nil -> :ok
+      first_ms -> log_to_file("[FIRST_AUDIO] [#{direction}] #{first_ms}ms")
+    end
     state
   end
 

@@ -1,0 +1,120 @@
+<ImplementationBacklog VERSION="0.1.0">
+  <Wave id="W3" name="IncrementalStreamingArchitecture">
+    <goal>Reduce perceived latency by overlapping STT, translation, queue control, and playback on stable partials rather than full-utterance boundaries.</goal>
+    <verification-ref>V-LATENCY-W3</verification-ref>
+    <gate-ref>Gate-Latency-W3</gate-ref>
+
+    <ExecutionOrder>
+      <step-1>W3-C1 incremental STT first, because partial and stable-partial events are the prerequisite signal for all downstream incremental work.</step-1>
+      <step-2>W3-C2 segmenter and queueing second, because stable partials need bounded downstream control before early playback is enabled.</step-2>
+      <step-3>W3-C3 incremental TTS last, because early playback should be layered on top of already-stabilized transcript and queue semantics.</step-3>
+    </ExecutionOrder>
+
+    <Change id="W3-C1" type="incremental-stt" priority="highest">
+      <summary>Emit partial and stable-partial transcript events from the STT layer while preserving current final transcript compatibility.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/stt/mod.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>lib/translator/audio_engine.ex</file>
+        <file>lib/translator/pipeline.ex</file>
+        <file>web/static/js/app.js</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Extend the STT event flow to emit `PARTIAL` and `STABLE_PARTIAL` markers before `FINAL` for the same utterance.</task-1>
+        <task-2>Carry the new event types through the Rust engine and Elixir event routing without breaking the existing final-transcript path.</task-2>
+        <task-3>Update pipeline state and UI handling so partials can be displayed or tracked distinctly from final transcripts.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <runtime-check>Run long-phrase tests and confirm `[STT] PARTIAL`, `[STT] STABLE_PARTIAL`, and `[STT] FINAL` markers appear in sequence.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>Stable partials reach the UI before final transcript completion.</item>
+        <item>Final transcripts remain backward-compatible with the current event flow.</item>
+        <item>`pipeline_trace.log` shows `PARTIAL`, `STABLE_PARTIAL`, and `FINAL` markers for incremental runs.</item>
+      </done-when>
+      <stop-if>
+        <item>Partial event emission breaks the current final transcript contract.</item>
+        <item>UI or pipeline state becomes ambiguous between live and final transcript ownership.</item>
+      </stop-if>
+    </Change>
+
+    <Change id="W3-C2" type="segmenter-and-queueing" priority="high">
+      <summary>Add text stabilization and stale-job cancellation so repeated prefixes are not retranslated or replayed unnecessarily.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/engine.rs</file>
+        <file>native/audio_engine/src/pipeline/segmenter.rs</file>
+        <file>native/audio_engine/src/pipeline/job_queue.rs</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Introduce a segmenter that identifies confirmed stable text boundaries suitable for downstream translation and playback.</task-1>
+        <task-2>Introduce queue control that coalesces updates and cancels or drops stale translation and TTS jobs.</task-2>
+        <task-3>Emit explicit runtime markers when stale work is canceled or dropped so queue behavior is visible during verification.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <runtime-check>Run repeated long-phrase tests and confirm stable prefixes are not translated repeatedly and stale jobs are explicitly reported.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>Repeated partial prefixes are not retranslated unnecessarily.</item>
+        <item>Stale translation and TTS jobs are canceled or dropped with explicit log markers.</item>
+        <item>`queue_drop_count` can be inferred from runtime evidence.</item>
+      </done-when>
+      <stop-if>
+        <item>Queue control silently drops essential work with no audit trail.</item>
+        <item>Segment stabilization causes duplicated translation output or lost confirmed text.</item>
+      </stop-if>
+    </Change>
+
+    <Change id="W3-C3" type="incremental-tts" priority="high">
+      <summary>Allow early playback from confirmed translated segments instead of waiting for full utterance completion.</summary>
+      <write-scope>
+        <file>native/audio_engine/src/tts/mod.rs</file>
+        <file>native/audio_engine/src/tts/scheduler.rs</file>
+        <file>native/audio_engine/src/engine.rs</file>
+      </write-scope>
+      <implementation-tasks>
+        <task-1>Introduce a scheduler or equivalent control path that can queue early audio from confirmed translated segments.</task-1>
+        <task-2>Measure and emit `time_to_first_audio_ms` independently from full-utterance `total_ms`.</task-2>
+        <task-3>Ensure incremental playback does not duplicate or replay already-confirmed audio when later text arrives.</task-3>
+      </implementation-tasks>
+      <verification-step>
+        <command>cargo check</command>
+        <command>mix compile</command>
+        <runtime-check>Run long-phrase tests and confirm playback starts before full-utterance completion while avoiding duplicated output.</runtime-check>
+      </verification-step>
+      <done-when>
+        <item>`time_to_first_audio_ms` is logged and measured separately from total utterance time.</item>
+        <item>Users hear the beginning of the translation before the source speaker finishes long sentences.</item>
+        <item>Runtime logs support verification that early playback preceded final transcript completion.</item>
+      </done-when>
+      <stop-if>
+        <item>Incremental playback introduces duplicated or out-of-order translated audio.</item>
+        <item>Early playback hides failures that should remain observable in runtime evidence.</item>
+      </stop-if>
+    </Change>
+
+    <WaveCloseout>
+      <required-commands>
+        <command>cargo check</command>
+        <command>mix compile</command>
+      </required-commands>
+      <required-runtime-evidence>
+        <item>[STT] PARTIAL text='...'</item>
+        <item>[STT] STABLE_PARTIAL text='...'</item>
+        <item>[STT] FINAL stt=Nms text='...'</item>
+        <item>time_to_first_audio_ms=N</item>
+        <item>stale job dropped/canceled</item>
+      </required-runtime-evidence>
+      <acceptance-targets>
+        <item>Stable partial appears meaningfully earlier than final transcript on long phrases.</item>
+        <item>Playback begins before full-utterance completion on long phrases.</item>
+        <item>Stale jobs are controlled explicitly rather than accumulating invisible backlog.</item>
+      </acceptance-targets>
+      <baseline-scenarios>
+        <scenario>LongSentencePartialLead</scenario>
+      </baseline-scenarios>
+    </WaveCloseout>
+  </Wave>
+</ImplementationBacklog>

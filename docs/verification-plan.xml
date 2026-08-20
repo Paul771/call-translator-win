@@ -78,7 +78,7 @@
       </required-signals>
     </VF-CONFIG>
 
-    <VF-RAW-RMS NAME="RawRmsNoiseFilter" PRIORITY="high" verified="2026-06-14">
+<VF-RAW-RMS NAME="RawRmsNoiseFilter" PRIORITY="high" verified="2026-06-14">
       <scenario>Whisper STT receives background noise (raw_rms &lt; 0.015) and must NOT produce hallucinated transcripts</scenario>
       <expected-outcome>Avg raw_rms across buffer is computed from pre-gain values; if below 0.015, poll_transcript returns None without invoking Python/Whisper</expected-outcome>
       <required-signals>
@@ -107,6 +107,38 @@
         <evidence type="trace-assertion">WAV files created in TEMP confirm Whisper subprocess was invoked</evidence>
       </test-evidence>
     </VF-WINDOW-HIDE>
+
+    <VF-LATENCY-BASELINE NAME="LatencyBaselineCapture" PRIORITY="high">
+      <scenario>Collect per-stage latency on the current pipeline before and after each wave.</scenario>
+      <expected-outcome>Each utterance yields comparable STT, translation, TTS, and total timings with provider attribution.</expected-outcome>
+      <required-signals>
+        <log-marker>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</log-marker>
+        <log-marker>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</log-marker>
+        <log-marker>provider_used=...</log-marker>
+      </required-signals>
+    </VF-LATENCY-BASELINE>
+
+    <VF-LOCAL-FIRST NAME="LocalFirstPipelineRUEN" PRIORITY="high">
+      <scenario>Run the ru/en path with local STT and local MT, without relying on Deepgram, Groq, LiteLLM, or Yandex on the hot path.</scenario>
+      <expected-outcome>Both pipelines produce transcript, translation, and TTS events in local-only mode.</expected-outcome>
+      <required-signals>
+        <log-marker>[outgoing] STT TRANSCRIPT stt=Nms text='...'</log-marker>
+        <log-marker>[incoming] STT TRANSCRIPT stt=Nms text='...'</log-marker>
+        <log-marker>provider_used=local_mt</log-marker>
+        <log-marker>[outgoing] TTS OK Nms samples=N</log-marker>
+        <log-marker>[incoming] TTS OK Nms samples=N</log-marker>
+      </required-signals>
+    </VF-LOCAL-FIRST>
+
+    <VF-INCREMENTAL-PARTIALS NAME="IncrementalPartials" PRIORITY="medium">
+      <scenario>Stable partial transcripts are emitted before final utterance completion and can trigger early downstream work.</scenario>
+      <expected-outcome>UI and logs observe stable partials earlier than final transcript markers.</expected-outcome>
+      <required-signals>
+        <log-marker>[STT] PARTIAL text='...'</log-marker>
+        <log-marker>[STT] STABLE_PARTIAL text='...'</log-marker>
+        <log-marker>[STT] FINAL stt=Nms text='...'</log-marker>
+      </required-signals>
+    </VF-INCREMENTAL-PARTIALS>
   </CriticalFlows>
 
   <ModuleVerification>
@@ -247,6 +279,75 @@
         <marker>Flask SSE streams [STT]/[TR]/[TOTAL] events</marker>
       </required-log-markers>
     </V-M-WEB>
+
+    <V-LATENCY-W1 MODULE="M-ENGINE,M-STT,M-TRANSLATION,M-ELIXIR" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log</file>
+        <file>groq_debug.log</file>
+        <file>litellm_debug.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+        <check-2>mix compile</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Realtime endpointing values are reduced and visible in STT connection logs.</scenario-1>
+        <scenario-2 kind="success">Translation fallback returns the first successful provider instead of waiting through serial retries.</scenario-2>
+        <scenario-3 kind="success">Per-utterance latency logs include provider attribution for comparison against baseline.</scenario-3>
+        <scenario-4 kind="failure">Realtime profile still waits on long retries or long translation timeouts.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[STT] connecting lang=... rate=16000Hz endpointing=...ms</marker>
+        <marker>provider_used=...</marker>
+        <marker>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</marker>
+        <marker>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</marker>
+      </required-log-markers>
+    </V-LATENCY-W1>
+
+    <V-LATENCY-W2 MODULE="M-STT,M-TRANSLATION,M-ENGINE,M-ELIXIR,M-WEB" PRIORITY="high">
+      <test-files>
+        <file>pipeline_trace.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+        <check-2>mix compile</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Persistent local STT operates without temp WAV roundtrips or per-utterance worker launch.</scenario-1>
+        <scenario-2 kind="success">Local ru→en and en→ru translation works through the integrated local provider.</scenario-2>
+        <scenario-3 kind="success">Audio playback follows the fast local path without waiting for cloud correction.</scenario-3>
+        <scenario-4 kind="failure">The local-first preset still attempts cloud providers on the critical path.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[outgoing] STT TRANSCRIPT stt=Nms text='...'</marker>
+        <marker>[incoming] STT TRANSCRIPT stt=Nms text='...'</marker>
+        <marker>provider_used=local_mt</marker>
+        <marker>[outgoing] TTS OK Nms samples=N</marker>
+        <marker>[incoming] TTS OK Nms samples=N</marker>
+      </required-log-markers>
+    </V-LATENCY-W2>
+
+    <V-LATENCY-W3 MODULE="M-STT,M-TRANSLATION,M-ENGINE,M-TTS,M-WEB" PRIORITY="medium">
+      <test-files>
+        <file>pipeline_trace.log</file>
+      </test-files>
+      <module-checks>
+        <check-1>cargo check</check-1>
+        <check-2>mix compile</check-2>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Stable partial transcripts appear before final transcript completion.</scenario-1>
+        <scenario-2 kind="success">Stale translation and TTS jobs are canceled or dropped rather than accumulating backlog.</scenario-2>
+        <scenario-3 kind="success">Playback starts from confirmed translated segments before full-utterance completion on long phrases.</scenario-3>
+        <scenario-4 kind="failure">Incremental mode causes repeated retranslations of the same prefix or duplicated playback.</scenario-4>
+      </scenarios>
+      <required-log-markers>
+        <marker>[STT] PARTIAL text='...'</marker>
+        <marker>[STT] STABLE_PARTIAL text='...'</marker>
+        <marker>[STT] FINAL stt=Nms text='...'</marker>
+        <marker>time_to_first_audio_ms=N</marker>
+      </required-log-markers>
+    </V-LATENCY-W3>
   </ModuleVerification>
 
   <PhaseGates>
@@ -276,6 +377,48 @@
         <evidence-3>Both pipelines produce at least 3 translations per test run</evidence-3>
       </required-evidence>
     </Gate-Phase-2>
+
+    <Gate-Latency-W1 PHASE="Latency-W1" name="FastLatencyRelief">
+      <goal>Current pipeline tail latency is reduced without loss of end-to-end functionality.</goal>
+      <commands>
+        <command-1>cargo check</command-1>
+        <command-2>mix compile</command-2>
+        <command-3>Run both pipelines and compare per-stage latency logs against baseline</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>Updated STT endpointing values appear in connection logs</evidence-1>
+        <evidence-2>provider_used markers are present on translation path</evidence-2>
+        <evidence-3>p95 translate latency improves on degraded-network comparison runs</evidence-3>
+      </required-evidence>
+    </Gate-Latency-W1>
+
+    <Gate-Latency-W2 PHASE="Latency-W2" name="LocalFirstCriticalPath">
+      <goal>ru/en dual pipeline operates end-to-end in local-first mode without cloud dependency on the hot path.</goal>
+      <commands>
+        <command-1>cargo check</command-1>
+        <command-2>mix compile</command-2>
+        <command-3>Run both pipelines with local-first preset and verify transcript, translation, and TTS markers</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>provider_used=local_mt appears for translation events</evidence-1>
+        <evidence-2>Both directions emit transcript and TTS markers without external API availability</evidence-2>
+        <evidence-3>Audio output follows the local path without waiting for cloud correction</evidence-3>
+      </required-evidence>
+    </Gate-Latency-W2>
+
+    <Gate-Latency-W3 PHASE="Latency-W3" name="IncrementalStreamingArchitecture">
+      <goal>Stable partials and early playback reduce perceived response time below full-utterance latency.</goal>
+      <commands>
+        <command-1>cargo check</command-1>
+        <command-2>mix compile</command-2>
+        <command-3>Run long-phrase tests and verify partial, stable-partial, and early-audio markers</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>Stable partial markers appear before final transcript markers</evidence-1>
+        <evidence-2>time_to_first_audio_ms is logged</evidence-2>
+        <evidence-3>Playback begins before full utterance completion on long phrases</evidence-3>
+      </required-evidence>
+    </Gate-Latency-W3>
   </PhaseGates>
 
   <VerificationLevels>

@@ -16,7 +16,7 @@
     </M-ENGINE>
 
     <M-STT NAME="STT" TYPE="INTEGRATION" STATUS="implemented">
-      <purpose>Speech-to-text: Deepgram WS + Whisper fallback + Yandex fallback</purpose>
+      <purpose>Speech-to-text: Deepgram WS + Whisper fallback + Yandex fallback, with planned local-first persistent STT path for low-latency mode</purpose>
       <path>native/audio_engine/src/stt/</path>
       <depends>none</depends>
       <verification-ref>V-M-STT</verification-ref>
@@ -28,7 +28,7 @@
     </M-STT>
 
     <M-TRANSLATION NAME="Translation" TYPE="INTEGRATION" STATUS="implemented">
-      <purpose>Text translation: Groq→LiteLLM→Yandex fallback</purpose>
+      <purpose>Text translation: Groq→LiteLLM→Yandex fallback, with planned local CTranslate2-based translation for low-latency mode</purpose>
       <path>native/audio_engine/src/translation/</path>
       <depends>none</depends>
       <verification-ref>V-M-TRANSLATION</verification-ref>
@@ -80,5 +80,7 @@
     <CrossLink from="M-ENGINE" to="M-AUDIO" relation="uses for audio capture/playback" />
     <CrossLink from="M-ELIXIR" to="M-ENGINE" relation="manages via port" />
     <CrossLink from="M-WEB" to="M-ELIXIR" relation="sends commands via HTTP" />
+    <CrossLink from="M-STT" to="M-TRANSLATION" relation="planned stable-partial handoff for low-latency mode" />
+    <CrossLink from="M-TRANSLATION" to="M-TTS" relation="planned incremental segment playback for low-latency mode" />
   </Project>
 </KnowledgeGraph>

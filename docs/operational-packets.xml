@@ -21,6 +21,63 @@
     </ExecutionPacket>
   </ExecutionPacketTemplate>
 
+  <ExecutionPacket>
+    <packet-id>W1-FastLatencyRelief</packet-id>
+    <module-id>M-ENGINE,M-STT,M-TRANSLATION,M-ELIXIR</module-id>
+    <module-name>FastLatencyRelief Wave</module-name>
+    <purpose>Reduce avoidable latency on the current cloud-centric pipeline without changing the visible dual-pipeline product flow.</purpose>
+    <write-scope>
+      <file-1>native/audio_engine/src/stt/mod.rs</file-1>
+      <file-2>native/audio_engine/src/translation/mod.rs</file-2>
+      <file-3>native/audio_engine/src/translation/yandex.rs</file-3>
+      <file-4>native/audio_engine/src/engine.rs</file-4>
+      <file-5>lib/translator/audio_engine.ex</file-5>
+    </write-scope>
+    <contract-excerpt><![CDATA[
+M-ENGINE orchestrates the STT→Translate→TTS chain for incoming and outgoing pipelines.
+M-STT provides transcript production from Deepgram, Yandex, or Whisper paths.
+M-TRANSLATION provides translation from Groq, LiteLLM, or Yandex and is being tuned for faster realtime fallback behavior.
+M-ELIXIR injects runtime config and routes telemetry from the Rust engine.
+]]></contract-excerpt>
+    <verification-excerpt><![CDATA[
+V-LATENCY-W1 and Gate-Latency-W1 apply.
+Required commands: cargo check, mix compile.
+Required runtime evidence:
+  - [STT] connecting lang=... rate=16000Hz endpointing=...ms
+  - [outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms
+  - [incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms
+  - provider_used=...
+Acceptance targets:
+  - short phrase p50 stt_final_ms improves by at least 300 ms versus baseline
+  - degraded-network p95 translate_ms improves by at least 30 percent versus serial fallback baseline
+  - no regression in transcript completion reliability
+]]></verification-excerpt>
+    <assumptions>
+      <assumption-1>Existing Deepgram, Groq, LiteLLM, or Yandex integrations remain functionally available for comparison runs.</assumption-1>
+      <assumption-2>Same device routing and language pair are used before and after W1 for latency comparison.</assumption-2>
+      <assumption-3>pipeline_trace.log and provider-specific debug logs remain available during runtime verification.</assumption-3>
+    </assumptions>
+    <stop-conditions>
+      <condition-1>Stop if transcript completion reliability materially regresses while tuning endpointing or timeouts.</condition-1>
+      <condition-2>Stop if both pipelines fail to start or stop producing transcript events within the autonomy gate window.</condition-2>
+      <condition-3>Stop if changes require contract-level behavior changes instead of hot-path tuning; escalate before editing module contracts.</condition-3>
+      <condition-4>Stop if degraded-network tuning removes fallback correctness or hides provider identity in logs.</condition-4>
+    </stop-conditions>
+    <implementation-slices>
+      <slice-1>Lower STT finalization delay for realtime mode and expose the tuned profile through Elixir-configured runtime settings.</slice-1>
+      <slice-2>Replace serial translation fallback behavior with first-success wins for realtime mode.</slice-2>
+      <slice-3>Remove per-request HTTP client setup and long retry pauses from the translation hot path.</slice-3>
+      <slice-4>Add or normalize latency and provider markers needed for baseline comparison.</slice-4>
+    </implementation-slices>
+    <runtime-evidence-plan>
+      <baseline-scenario-1>ShortPhraseOutgoingRUEN</baseline-scenario-1>
+      <baseline-scenario-2>ShortPhraseIncomingENRU</baseline-scenario-2>
+      <baseline-scenario-3>DegradedNetworkFallback</baseline-scenario-3>
+      <sample-policy>Capture at least 10 short-phrase samples per direction before and after W1.</sample-policy>
+    </runtime-evidence-plan>
+    <retry-budget>1</retry-budget>
+  </ExecutionPacket>
+
   <FailurePacketTemplate>
     <FailurePacket>
       <scenario>Deepgram WS drops every ~20s (error 10054)</scenario>

@@ -14,8 +14,8 @@ impl YandexTranslator {
             if api_key.len() >= 4 { &api_key[..4] } else { "?" },
             api_key.len());
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .context("Failed to build Yandex HTTP client")?;
         Ok(Self {

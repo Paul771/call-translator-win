@@ -1,0 +1,212 @@
+<LatencyVerificationMatrix VERSION="0.1.0">
+  <Purpose>
+    <summary>Wave-by-wave metric matrix and runtime evidence plan for pipeline latency improvements.</summary>
+    <scope>W1 FastLatencyRelief, W2 LocalFirstCriticalPath, W3 IncrementalStreamingArchitecture</scope>
+    <related-doc-1>docs/pipeline-latency-fix-plan.xml</related-doc-1>
+    <related-doc-2>docs/verification-plan.xml</related-doc-2>
+    <related-doc-3>docs/development-plan.xml</related-doc-3>
+  </Purpose>
+
+  <GlobalMeasurementPolicy>
+    <rule-1>Capture baseline metrics before each wave starts and compare against the same scenario after the wave is verified.</rule-1>
+    <rule-2>Use the same device routing, language pair, phrase set, and logging level during before/after comparisons.</rule-2>
+    <rule-3>Prefer p50 and p95 values over single-run samples.</rule-3>
+    <rule-4>Track both success-path latency and degraded-network fallback behavior.</rule-4>
+    <rule-5>Do not accept latency improvements that materially reduce transcript completion reliability.</rule-5>
+  </GlobalMeasurementPolicy>
+
+  <MetricCatalog>
+    <metric id="M1">
+      <name>stt_final_ms</name>
+      <definition>Elapsed time from audio delivery into STT session until final transcript emission for an utterance.</definition>
+      <source>[STT] FINAL stt=Nms text='...'</source>
+      <applies>W1, W2, W3</applies>
+    </metric>
+    <metric id="M2">
+      <name>translate_ms</name>
+      <definition>Elapsed time from translation worker start until translated text is emitted.</definition>
+      <source>[direction] TRANSLATE OK Nms result='...'</source>
+      <applies>W1, W2, W3</applies>
+    </metric>
+    <metric id="M3">
+      <name>tts_ms</name>
+      <definition>Elapsed time for TTS synthesis once translated text is available.</definition>
+      <source>[direction] TTS OK Nms samples=N</source>
+      <applies>W1, W2, W3</applies>
+    </metric>
+    <metric id="M4">
+      <name>total_ms</name>
+      <definition>Total end-to-end latency reported by the current utterance path.</definition>
+      <source>[direction] METRICS stt=Nms translate=Nms tts=Nms total=Nms</source>
+      <applies>W1, W2, W3</applies>
+    </metric>
+    <metric id="M5">
+      <name>provider_used</name>
+      <definition>Provider that produced the accepted translation result on the active path.</definition>
+      <source>provider_used=...</source>
+      <applies>W1, W2, W3</applies>
+    </metric>
+    <metric id="M6">
+      <name>time_to_first_audio_ms</name>
+      <definition>Elapsed time until first translated audio chunk is ready for playback.</definition>
+      <source>time_to_first_audio_ms=N</source>
+      <applies>W3</applies>
+    </metric>
+    <metric id="M7">
+      <name>stable_partial_lead_ms</name>
+      <definition>Time gap between first stable partial emission and final transcript emission for the same utterance.</definition>
+      <source>[STT] STABLE_PARTIAL ..., [STT] FINAL ...</source>
+      <applies>W3</applies>
+    </metric>
+    <metric id="M8">
+      <name>queue_drop_count</name>
+      <definition>Number of stale translation or TTS jobs dropped or canceled by queue control.</definition>
+      <source>stale job dropped/canceled markers in engine trace</source>
+      <applies>W2, W3</applies>
+    </metric>
+  </MetricCatalog>
+
+  <BaselineScenarioSet>
+    <scenario id="B1">
+      <name>ShortPhraseOutgoingRUEN</name>
+      <direction>outgoing</direction>
+      <phrase-class>short</phrase-class>
+      <goal>Measure response time on a short Russian phrase translated to English.</goal>
+      <expected-evidence>[outgoing] METRICS ... total=Nms</expected-evidence>
+    </scenario>
+    <scenario id="B2">
+      <name>ShortPhraseIncomingENRU</name>
+      <direction>incoming</direction>
+      <phrase-class>short</phrase-class>
+      <goal>Measure response time on a short English phrase translated to Russian.</goal>
+      <expected-evidence>[incoming] METRICS ... total=Nms</expected-evidence>
+    </scenario>
+    <scenario id="B3">
+      <name>DegradedNetworkFallback</name>
+      <direction>both</direction>
+      <phrase-class>short</phrase-class>
+      <goal>Observe fallback behavior when Groq or Deepgram are slow, blocked, or unavailable.</goal>
+      <expected-evidence>[FALLBACK] ..., provider_used=...</expected-evidence>
+    </scenario>
+    <scenario id="B4">
+      <name>LongSentencePartialLead</name>
+      <direction>both</direction>
+      <phrase-class>long</phrase-class>
+      <goal>Measure stable partial lead and first-audio lead for incremental mode.</goal>
+      <expected-evidence>[STT] STABLE_PARTIAL ..., time_to_first_audio_ms=N</expected-evidence>
+    </scenario>
+  </BaselineScenarioSet>
+
+  <WaveMatrix>
+    <Wave id="W1" verification-ref="V-LATENCY-W1">
+      <Goal>Reduce hot-path latency in the current cloud-centric flow.</Goal>
+      <PrimaryMetrics>
+        <metric-ref>M1</metric-ref>
+        <metric-ref>M2</metric-ref>
+        <metric-ref>M4</metric-ref>
+        <metric-ref>M5</metric-ref>
+      </PrimaryMetrics>
+      <SecondaryMetrics>
+        <metric-ref>M3</metric-ref>
+      </SecondaryMetrics>
+      <RuntimeEvidence>
+        <item>[STT] connecting lang=... rate=16000Hz endpointing=...ms</item>
+        <item>[outgoing] METRICS stt=Nms translate=Nms tts=Nms total=Nms</item>
+        <item>[incoming] METRICS stt=Nms translate=Nms tts=Nms total=Nms</item>
+        <item>provider_used=...</item>
+      </RuntimeEvidence>
+      <AcceptanceTargets>
+        <target metric="stt_final_ms">Short phrase p50 improves by at least 300 ms versus baseline after endpointing change.</target>
+        <target metric="translate_ms">Degraded-network p95 improves by at least 30 percent versus serial fallback baseline.</target>
+        <target metric="total_ms">No regression in end-to-end completion reliability while reducing latency.</target>
+      </AcceptanceTargets>
+      <Scenarios>
+        <scenario-ref>B1</scenario-ref>
+        <scenario-ref>B2</scenario-ref>
+        <scenario-ref>B3</scenario-ref>
+      </Scenarios>
+    </Wave>
+
+    <Wave id="W2" verification-ref="V-LATENCY-W2">
+      <Goal>Establish a local-only ru/en critical path for transcript, translation, and TTS.</Goal>
+      <PrimaryMetrics>
+        <metric-ref>M1</metric-ref>
+        <metric-ref>M2</metric-ref>
+        <metric-ref>M4</metric-ref>
+        <metric-ref>M5</metric-ref>
+      </PrimaryMetrics>
+      <SecondaryMetrics>
+        <metric-ref>M8</metric-ref>
+      </SecondaryMetrics>
+      <RuntimeEvidence>
+        <item>[outgoing] STT TRANSCRIPT stt=Nms text='...'</item>
+        <item>[incoming] STT TRANSCRIPT stt=Nms text='...'</item>
+        <item>provider_used=local_mt</item>
+        <item>[outgoing] TTS OK Nms samples=N</item>
+        <item>[incoming] TTS OK Nms samples=N</item>
+      </RuntimeEvidence>
+      <AcceptanceTargets>
+        <target metric="provider_used">ru/en hot path uses `local_mt` instead of Groq, LiteLLM, or Yandex.</target>
+        <target metric="translate_ms">Short phrase translation variance is lower than the cloud fallback baseline.</target>
+        <target metric="total_ms">p50 total latency approaches local-path target without requiring external API availability.</target>
+      </AcceptanceTargets>
+      <Scenarios>
+        <scenario-ref>B1</scenario-ref>
+        <scenario-ref>B2</scenario-ref>
+        <scenario-ref>B3</scenario-ref>
+      </Scenarios>
+    </Wave>
+
+    <Wave id="W3" verification-ref="V-LATENCY-W3">
+      <Goal>Reduce perceived latency through stable partials, queue control, and early playback.</Goal>
+      <PrimaryMetrics>
+        <metric-ref>M6</metric-ref>
+        <metric-ref>M7</metric-ref>
+        <metric-ref>M8</metric-ref>
+      </PrimaryMetrics>
+      <SecondaryMetrics>
+        <metric-ref>M1</metric-ref>
+        <metric-ref>M4</metric-ref>
+      </SecondaryMetrics>
+      <RuntimeEvidence>
+        <item>[STT] PARTIAL text='...'</item>
+        <item>[STT] STABLE_PARTIAL text='...'</item>
+        <item>[STT] FINAL stt=Nms text='...'</item>
+        <item>time_to_first_audio_ms=N</item>
+        <item>stale job dropped/canceled</item>
+      </RuntimeEvidence>
+      <AcceptanceTargets>
+        <target metric="stable_partial_lead_ms">Stable partial appears meaningfully earlier than final transcript on long phrases.</target>
+        <target metric="time_to_first_audio_ms">Playback begins before full-utterance completion on long phrases.</target>
+        <target metric="queue_drop_count">Stale jobs are controlled explicitly rather than accumulating invisible backlog.</target>
+      </AcceptanceTargets>
+      <Scenarios>
+        <scenario-ref>B4</scenario-ref>
+      </Scenarios>
+    </Wave>
+  </WaveMatrix>
+
+  <RuntimeEvidenceCollection>
+    <logs>
+      <file>pipeline_trace.log</file>
+      <file>groq_debug.log</file>
+      <file>litellm_debug.log</file>
+    </logs>
+    <commands>
+      <command>cargo check</command>
+      <command>mix compile</command>
+      <command>Run dual pipeline with reproducible short and long phrase sets</command>
+    </commands>
+    <collection-notes>
+      <note>Use the same machine, device routing, and model configuration before and after each wave.</note>
+      <note>Record at least 10 short-phrase samples per direction for p50 and p95 calculations.</note>
+      <note>Record at least 5 long-phrase samples for stable-partial and first-audio measurements once W3 begins.</note>
+    </collection-notes>
+  </RuntimeEvidenceCollection>
+
+  <Traceability>
+    <map wave="W1" plan-ref="docs/pipeline-latency-fix-plan.xml#W1" verification-ref="V-LATENCY-W1" gate-ref="Gate-Latency-W1" />
+    <map wave="W2" plan-ref="docs/pipeline-latency-fix-plan.xml#W2" verification-ref="V-LATENCY-W2" gate-ref="Gate-Latency-W2" />
+    <map wave="W3" plan-ref="docs/pipeline-latency-fix-plan.xml#W3" verification-ref="V-LATENCY-W3" gate-ref="Gate-Latency-W3" />
+  </Traceability>
+</LatencyVerificationMatrix>

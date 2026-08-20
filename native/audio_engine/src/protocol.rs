@@ -43,7 +43,24 @@ pub enum Event {
         lang: String,
         stt_ms: u64,
     },
+    PartialTranscript {
+        direction: String,
+        text: String,
+        lang: String,
+        stt_ms: u64,
+    },
+    StablePartialTranscript {
+        direction: String,
+        text: String,
+        lang: String,
+        stt_ms: u64,
+    },
     Translation {
+        direction: String,
+        text: String,
+        translate_ms: u64,
+    },
+    TranslationRevised {
         direction: String,
         text: String,
         translate_ms: u64,
@@ -53,6 +70,10 @@ pub enum Event {
         stt_ms: u64,
         translate_ms: u64,
         tts_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_used: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        time_to_first_audio_ms: Option<u64>,
     },
     Error {
         message: String,

@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 directml = []
+local-mt = []
 
 [[bin]]
 name = "test_onnx_session"
@@ -32,3 +33,6 @@ tungstenite = { version = "0.21.0", features = ["native-tls"] }
 base64 = "0.22.1"
 wasapi = "0.23.0"
 windows = { version = "0.62", features = ["Win32_Media_Multimedia", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Devices_Properties", "Win32_Devices_FunctionDiscovery"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ct2rs = { version = "0.10", optional = true }
