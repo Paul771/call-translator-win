@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Deferred fixes discovered during W1-W3 architecture review (2026-08-20).
+  Status: PENDING — not yet implemented. Fixes 1-2 are DONE (see ChangeLog).
+-->
+<DeferredFixes>
+  <Context>
+    <note>Reviewed merged origin/master (W1-W3 latency waves). Items below are architectural defects that were intentionally deferred. Fixes 1-2 (reconnect chain, segmenter reset) already applied.</note>
+  </Context>
+
+  <Fix id="DF-3" PRIORITY="medium" STATUS="pending">
+    <title>JobQueue does not actually cancel stale work</title>
+    <file>native/audio_engine/src/engine.rs</file>
+    <file>native/audio_engine/src/pipeline/job_queue.rs</file>
+    <problem>
+      `job_queue.is_stale(job_id)` is checked only AFTER `process_utterance`
+      completes, i.e. after TTS playback already happened. The stale check is
+      just a log line (`stale job #N dropped`) — no work is actually cancelled.
+      The module comment claims "stale work can be canceled" but nothing does.
+    </problem>
+    <options>
+      <option>Gate TTS playback: hold translated audio until try_commit returns true, drop otherwise. Requires restructure: process_utterance returns audio, commit decision happens before playback.</option>
+      <option>Remove JobQueue entirely and the stale log lines, keeping only TextSegmenter for delta extraction (simpler, honest).</option>
+    </options>
+    <verification>
+      Log marker `stale job #N dropped` should never appear after fix (either playback is truly gated or the queue is removed).
+    </verification>
+  </Fix>
+
+  <Fix id="DF-4" PRIORITY="medium" STATUS="pending">
+    <title>Whisper worker hardcodes 16000 Hz sample rate</title>
+    <file>whisper_worker.py</file>
+    <file>native/audio_engine/src/stt/whisper_stt.rs</file>
+    <problem>
+      `whisper_worker.py` builds a WAV header with hardcoded 16000 Hz
+      (line ~37), but `stt_sample_rate` is a runtime value passed to the Rust
+      session. If sample_rate differs, audio is misinterpreted.
+    </problem>
+    <fix-direction>
+      Include `sample_rate` in the `transcribe` JSON message; worker writes it
+      into the WAV header. Update whisper_stt.rs `send_audio`/`poll_transcript`
+      accordingly.
+    </fix-direction>
+  </Fix>
+
+  <Fix id="DF-5" PRIORITY="high" STATUS="pending">
+    <title>Whisper worker: no error handling — silent worker death</title>
+    <file>whisper_worker.py</file>
+    <problem>
+      No try/except around `transcribe_audio_b64`. If transcription raises
+      (bad audio, model error), the worker dies silently; Rust only notices via
+      the 8s read timeout and must kill/recreate the process. Slow recovery.
+    </problem>
+    <fix-direction>
+      Wrap transcribe in try/except, always `write_msg({"error": ...})` so Rust
+      gets a fast, structured failure instead of a timeout.
+    </fix-direction>
+  </Fix>
+
+  <Fix id="DF-6" PRIORITY="medium" STATUS="pending">
+    <title>local_first preset can panic on unconfigured local MT</title>
+    <file>lib/translator/audio_engine.ex</file>
+    <file>native/audio_engine/src/translation/mod.rs</file>
+    <problem>
+      When `local_first: true` is set in settings, Elixir forces
+      STT_PROVIDER=whisper + TRANSLATION_PROVIDER=local_mt. But local MT is
+      feature-gated (build-time `local-mt`) and model paths default to empty.
+      `translate_local_mt` panics (`expect`/`panic!`) inside a worker thread
+      when path is empty.
+    </problem>
+    <fix-direction>
+      Validate in Elixir: if local_mt paths are empty, log error and keep
+      previous provider instead of switching. In Rust, replace panic/expect
+      with `bail!` so the error propagates as a normal translation failure.
+    </fix-direction>
+  </Fix>
+
+  <Fix id="DF-7" PRIORITY="low" STATUS="pending">
+    <title>Hedge translation burns quota x3 in auto mode</title>
+    <file>native/audio_engine/src/translation/mod.rs</file>
+    <problem>
+      Auto mode launches Groq + LiteLLM + Yandex in parallel for every
+      utterance; first success wins, the other two requests are wasted.
+      Under metered APIs (Groq rate limits) this triples consumption.
+    </problem>
+    <fix-direction>
+      Consider staggered priorities (Groq first, fallbacks only on failure)
+      or a per-utterance concurrency budget; measure quota impact first.
+    </fix-direction>
+  </Fix>
+</DeferredFixes>

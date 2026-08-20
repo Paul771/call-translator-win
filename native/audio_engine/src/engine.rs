@@ -563,7 +563,7 @@ fn run_pipeline(
 
     let (audio_tx, audio_rx) = bounded::<AudioChunk>(512);
     let (playback_tx, playback_rx) = bounded::<Vec<f32>>(64);
-    let (proc_tx, proc_rx) = bounded::<(String, u64)>(64);
+    let (proc_tx, proc_rx) = bounded::<(String, u64, crate::stt::SttResultKind)>(64);
 
     let capture_rate: u32;
     // Keep capture alive for the duration of the pipeline loop
@@ -771,7 +771,7 @@ fn run_pipeline(
 
     let _proc_echo = set_other_suppress.clone();
     let _proc_handle = std::thread::spawn(move || {
-        while let Ok((text, stt_ms)) = proc_rx.recv() {
+        while let Ok((text, stt_ms, stt_kind)) = proc_rx.recv() {
             // Check if TTS has finished loading (non-blocking).
             if let Ok(Some(engine)) = tts_ready_rx.try_recv() {
                 tracelog::trace(&proc_direction, "TTS", "TTS engine ready, switching to full pipeline ✓");
@@ -780,6 +780,11 @@ fn run_pipeline(
                 tracelog::trace(&proc_direction, "TTS", "TTS engine failed, continuing without TTS");
                 tts = None;
             }
+
+            // A final transcript marks the end of an utterance: reset the
+            // segmenter so the next utterance starts with a clean slate,
+            // even if it shares a prefix with the previous one.
+            let is_final = stt_kind == crate::stt::SttResultKind::Final;
 
             // Segmenter: extract only the incremental delta from stable partials
             // to avoid retranslating the same prefix. Finals reset the segmenter.
@@ -795,6 +800,9 @@ fn run_pipeline(
                     lang: proc_source_lang.clone(),
                     stt_ms,
                 });
+                if is_final {
+                    segmenter.reset();
+                }
                 continue;
             };
 
@@ -819,6 +827,12 @@ fn run_pipeline(
                 &proc_playback_tx,
                 &proc_event_tx,
             );
+
+            // Final transcript: the utterance is complete. Reset the segmenter
+            // so the next utterance is treated as fresh, not as a continuation.
+            if is_final {
+                segmenter.reset();
+            }
 
             // Emit time-to-first-audio when audio is first produced for this utterance
             if _audio_len > 0 {
@@ -878,23 +892,22 @@ fn run_pipeline(
             session.close();
             std::thread::sleep(Duration::from_millis(backoff_ms));
 
-            // Auto mode: after MAX_DEEPGRAM_DROPS disconnections, switch to Yandex, then Whisper
-            if deepgram_drop_count >= MAX_DEEPGRAM_DROPS && stt_provider == "auto" {
-                if !yandex_key.is_empty() && !matches!(session, UnifiedSttSession::Yandex(_)) {
-                    warn!("[{}] Switching to Yandex STT after {} Deepgram drops", direction, deepgram_drop_count);
-                    if let Ok(ys) = crate::stt::yandex_stt::YandexSttSession::new(
-                        &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
-                    ) {
-                        session = UnifiedSttSession::Yandex(ys);
-                        need_reconnect = false;
-                        reconnect_attempts = 0;
-                        info!("[{}] Switched to Yandex STT ✓", direction);
-                        continue;
+            if matches!(session, UnifiedSttSession::Deepgram(_)) {
+                // Auto mode: after MAX_DEEPGRAM_DROPS disconnections, escalate to Yandex, then Whisper.
+                if deepgram_drop_count >= MAX_DEEPGRAM_DROPS && stt_provider == "auto" {
+                    if !yandex_key.is_empty() {
+                        warn!("[{}] Switching to Yandex STT after {} Deepgram drops", direction, deepgram_drop_count);
+                        if let Ok(ys) = crate::stt::yandex_stt::YandexSttSession::new(
+                            &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                        ) {
+                            session = UnifiedSttSession::Yandex(ys);
+                            need_reconnect = false;
+                            reconnect_attempts = 0;
+                            info!("[{}] Switched to Yandex STT ✓", direction);
+                            continue;
+                        }
+                        warn!("[{}] Yandex init failed, trying local Whisper", direction);
                     }
-                }
-                // If Yandex failed or not available, use local Whisper
-                if !matches!(session, UnifiedSttSession::Whisper(_)) {
-                    warn!("[{}] Switching to local Whisper STT", direction);
                     match crate::stt::whisper_stt::WhisperSttSession::new(stt_sample_rate, &whisper_model) {
                         Ok(ws) => {
                             session = UnifiedSttSession::Whisper(ws);
@@ -909,19 +922,74 @@ fn run_pipeline(
                         }
                     }
                 }
-            }
 
-            // Try reconnecting to Deepgram
-            match stt.create_session(stt_sample_rate) {
-                Ok(new_session) => {
-                    session = UnifiedSttSession::Deepgram(new_session);
-                    need_reconnect = false;
-                    reconnect_attempts = 0;
-                    info!("[{}] Deepgram reconnected (drop_count={})", direction, deepgram_drop_count);
+                // Stay on Deepgram: try reconnecting to Deepgram.
+                // On success the drop counter resets, so transient network blips
+                // don't permanently push us to a fallback provider.
+                match stt.create_session(stt_sample_rate) {
+                    Ok(new_session) => {
+                        session = UnifiedSttSession::Deepgram(new_session);
+                        need_reconnect = false;
+                        reconnect_attempts = 0;
+                        deepgram_drop_count = 0;
+                        info!("[{}] Deepgram reconnected (drop_count={})", direction, deepgram_drop_count);
+                    }
+                    Err(e) => {
+                        error!("[{}] Deepgram reconnect failed: {:#}", direction, e);
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    error!("[{}] Deepgram reconnect failed: {:#}", direction, e);
-                    continue;
+            } else if matches!(session, UnifiedSttSession::Yandex(_)) {
+                // Auto mode: after repeated Yandex failures, escalate to local Whisper.
+                if deepgram_drop_count >= MAX_DEEPGRAM_DROPS && stt_provider == "auto" {
+                    warn!("[{}] Yandex unstable ({} drops), switching to local Whisper STT", direction, deepgram_drop_count);
+                    match crate::stt::whisper_stt::WhisperSttSession::new(stt_sample_rate, &whisper_model) {
+                        Ok(ws) => {
+                            session = UnifiedSttSession::Whisper(ws);
+                            need_reconnect = false;
+                            reconnect_attempts = 0;
+                            info!("[{}] Switched to local Whisper STT ✓", direction);
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("[{}] Whisper init failed: {:#}", direction, e);
+                            continue;
+                        }
+                    }
+                }
+
+                // Stay on Yandex: restart the Yandex session.
+                match crate::stt::yandex_stt::YandexSttSession::new(
+                    &yandex_key, &yandex_folder_id, &stt_language, stt_sample_rate,
+                ) {
+                    Ok(ys) => {
+                        session = UnifiedSttSession::Yandex(ys);
+                        need_reconnect = false;
+                        reconnect_attempts = 0;
+                        deepgram_drop_count = 0;
+                        info!("[{}] Yandex reconnected ✓", direction);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("[{}] Yandex restart failed: {:#}", direction, e);
+                        continue;
+                    }
+                }
+            } else if matches!(session, UnifiedSttSession::Whisper(_)) {
+                // Whisper is the terminal fallback: restart it in place, never
+                // bounce back to a failing cloud STT provider.
+                match crate::stt::whisper_stt::WhisperSttSession::new(stt_sample_rate, &whisper_model) {
+                    Ok(ws) => {
+                        session = UnifiedSttSession::Whisper(ws);
+                        need_reconnect = false;
+                        reconnect_attempts = 0;
+                        info!("[{}] Whisper restarted ✓", direction);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("[{}] Whisper restart failed: {:#}", direction, e);
+                        continue;
+                    }
                 }
             }
         }
@@ -1003,13 +1071,13 @@ fn run_pipeline(
                             stt_ms: result.stt_latency_ms,
                         });
                         // Stable partials also go to the processor for early translation
-                        if let Err(e) = proc_tx.try_send((result.text, result.stt_latency_ms)) {
+                        if let Err(e) = proc_tx.try_send((result.text, result.stt_latency_ms, result.kind)) {
                             warn!("[{}] Processor channel full, dropping stable partial: {}", direction, e);
                         }
                     }
                     crate::stt::SttResultKind::Final => {
                         tracelog::trace(direction, "STT", &format!("FINAL stt={}ms text='{}'", result.stt_latency_ms, result.text));
-                        if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms)) {
+                        if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms, result.kind)) {
                             warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
                         } else {
                             tracelog::trace(direction, "STT", &format!("→ processor: '{}'", result.text));
