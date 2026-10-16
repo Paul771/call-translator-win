@@ -871,7 +871,12 @@ fn run_pipeline(
     let mut need_reconnect = false;
     let mut reconnect_attempts: u32 = 0;
     let mut deepgram_drop_count: u32 = 0;
+    // Time the current STT session was established. A drop after a session that
+    // stayed up for STABLE_SESSION_SECS starts a new incident; shorter sessions
+    // keep accumulating toward MAX_DEEPGRAM_DROPS.
+    let mut session_started = Instant::now();
     const MAX_DEEPGRAM_DROPS: u32 = 3;
+    const STABLE_SESSION_SECS: u64 = 60;
     const MAX_BACKOFF_MS: u64 = 30000;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
@@ -883,6 +888,10 @@ fn run_pipeline(
         }
 
         if need_reconnect {
+            if session_started.elapsed() >= Duration::from_secs(STABLE_SESSION_SECS) {
+                // This drop follows a healthy session: it is the first of a new incident.
+                deepgram_drop_count = 1;
+            }
             reconnect_attempts += 1;
             let backoff_ms = std::cmp::min(
                 2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
@@ -903,6 +912,7 @@ fn run_pipeline(
                             session = UnifiedSttSession::Yandex(ys);
                             need_reconnect = false;
                             reconnect_attempts = 0;
+                            session_started = Instant::now();
                             info!("[{}] Switched to Yandex STT ✓", direction);
                             continue;
                         }
@@ -913,6 +923,7 @@ fn run_pipeline(
                             session = UnifiedSttSession::Whisper(ws);
                             need_reconnect = false;
                             reconnect_attempts = 0;
+                            session_started = Instant::now();
                             info!("[{}] Switched to local Whisper STT ✓", direction);
                             continue;
                         }
@@ -923,15 +934,15 @@ fn run_pipeline(
                     }
                 }
 
-                // Stay on Deepgram: try reconnecting to Deepgram.
-                // On success the drop counter resets, so transient network blips
-                // don't permanently push us to a fallback provider.
+                // Stay on Deepgram: try reconnecting to Deepgram. The drop counter is
+                // not reset here; it resets only after a stable session (see above),
+                // so the ~20 s drop pattern still reaches the fallback threshold.
                 match stt.create_session(stt_sample_rate) {
                     Ok(new_session) => {
                         session = UnifiedSttSession::Deepgram(new_session);
                         need_reconnect = false;
                         reconnect_attempts = 0;
-                        deepgram_drop_count = 0;
+                        session_started = Instant::now();
                         info!("[{}] Deepgram reconnected (drop_count={})", direction, deepgram_drop_count);
                     }
                     Err(e) => {
@@ -948,6 +959,7 @@ fn run_pipeline(
                             session = UnifiedSttSession::Whisper(ws);
                             need_reconnect = false;
                             reconnect_attempts = 0;
+                            session_started = Instant::now();
                             info!("[{}] Switched to local Whisper STT ✓", direction);
                             continue;
                         }
@@ -966,7 +978,7 @@ fn run_pipeline(
                         session = UnifiedSttSession::Yandex(ys);
                         need_reconnect = false;
                         reconnect_attempts = 0;
-                        deepgram_drop_count = 0;
+                        session_started = Instant::now();
                         info!("[{}] Yandex reconnected ✓", direction);
                         continue;
                     }
@@ -983,6 +995,7 @@ fn run_pipeline(
                         session = UnifiedSttSession::Whisper(ws);
                         need_reconnect = false;
                         reconnect_attempts = 0;
+                        session_started = Instant::now();
                         info!("[{}] Whisper restarted ✓", direction);
                         continue;
                     }
@@ -999,6 +1012,11 @@ fn run_pipeline(
         let mut total_chunks_with_audio = 0usize;
         for chunk in audio_rx.try_iter().take(10) {
             if mute_flag.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Echo gate: the other pipeline's TTS is playing and may be picked up
+            // by this capture device, so its audio must not reach STT.
+            if my_suppress.load(Ordering::SeqCst) {
                 continue;
             }
             let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
