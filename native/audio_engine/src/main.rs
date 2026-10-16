@@ -6,6 +6,7 @@ mod stt;
 mod tracelog;
 mod translation;
 mod tts;
+mod vad;
 
 use std::io::{BufReader, BufWriter, Write};
 use std::thread;
