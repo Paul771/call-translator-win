@@ -1,0 +1,13 @@
+# Run output (transcripts, synthesized speech, engine logs)
+results/
+
+# Personal voice recordings stay local
+fixtures/user/
+
+# Generated synthetic audio is cheap to rebuild
+fixtures/synthetic/
+
+# Real manifest with personal phrases
+phrases.json
+
+__pycache__/
