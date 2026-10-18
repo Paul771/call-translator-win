@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod inject;
 pub mod loopback;
 pub mod playback;
 

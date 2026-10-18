@@ -224,6 +224,19 @@ impl Engine {
                 }]
             }
 
+            Command::InjectAudio { pipeline, path, tail_ms } => {
+                let tail = tail_ms.unwrap_or(audio::inject::DEFAULT_TAIL_MS);
+                match audio::inject::inject_wav(&pipeline, &path, tail, self.event_tx.clone()) {
+                    Ok(seconds) => vec![Event::Log {
+                        level: "info".into(),
+                        message: format!("inject_started {} {:.2}s", pipeline, seconds),
+                    }],
+                    Err(e) => vec![Event::Error {
+                        message: format!("inject_audio failed: {:#}", e),
+                    }],
+                }
+            }
+
             Command::ListDevices => match audio::list_devices() {
                 Ok((input, output)) => vec![Event::DeviceList { input, output }],
                 Err(e) => vec![Event::Error {
@@ -598,6 +611,12 @@ fn run_pipeline(
                 info!("[loopback-bridge] std::mpsc channel closed, bridge exiting");
             })
             .context("Failed to spawn loopback bridge thread")?;
+    } else if capture_device == audio::inject::INJECT_DEVICE {
+        // Test mode: audio is pushed in through the `inject_audio` command.
+        info!("[{}] Using virtual 'inject' capture (test mode)", direction);
+        tracelog::trace(direction, "DEVICE", "virtual inject capture (test mode)");
+        capture_rate = audio::inject::INJECT_RATE;
+        audio::inject::register(direction, audio_tx);
     } else {
         // Small delay to allow previous WASAPI sessions to fully release
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -610,7 +629,7 @@ fn run_pipeline(
         _capture_handle = Some(capture);
     }
 
-    let playback = AudioPlayback::new(playback_device, sample_rate, playback_rx)
+    let playback = audio::inject::Playback::open(playback_device, sample_rate, playback_rx)
         .with_context(|| format!("[{}] Failed to create AudioPlayback", direction))?;
 
     // Use the playback device's NATIVE rate for TTS — this matches what the hardware uses
@@ -1123,6 +1142,7 @@ fn run_pipeline(
     }
 
     session.close();
+    audio::inject::unregister(direction);
     let _ = playback.stop();
     drop(playback_tx);
 
