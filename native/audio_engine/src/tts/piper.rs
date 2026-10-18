@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use log::debug;
@@ -159,10 +160,21 @@ impl PiperTts {
 
     /// Call espeak-ng to convert text to IPA phonemes.
     fn phonemize(&self, text: &str) -> Result<String> {
-        let output = Command::new(&self.espeak_binary)
-            .args(["-q", "--ipa=2", "-v", &self.config.espeak.voice, text])
-            .output()
-            .context("Failed to run espeak-ng for phonemization")?;
+        // On Windows espeak-ng decodes command-line arguments with the ANSI code page,
+        // which turns Cyrillic into garbage phonemes. A UTF-8 file is read exactly.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let input_path = std::env::temp_dir().join(format!(
+            "piper_phonemize_{}_{}.txt",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&input_path, text).context("Failed to write phonemizer input file")?;
+        let result = Command::new(&self.espeak_binary)
+            .args(["-q", "--ipa=2", "-v", &self.config.espeak.voice, "-f"])
+            .arg(&input_path)
+            .output();
+        let _ = std::fs::remove_file(&input_path);
+        let output = result.context("Failed to run espeak-ng for phonemization")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

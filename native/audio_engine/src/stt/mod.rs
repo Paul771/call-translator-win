@@ -24,6 +24,9 @@ fn log_file(msg: &str) {
     }
 }
 
+/// Smallest `utterance_end_ms` the Deepgram streaming API accepts.
+const MIN_UTTERANCE_END_MS: u32 = 1000;
+
 pub struct DeepgramStt {
     api_key: String,
     language: String,
@@ -38,6 +41,8 @@ impl DeepgramStt {
             "no" => "nb",
             code => code,
         }.to_string();
+        // Deepgram answers HTTP 400 to utterance_end_ms below 1000 (the app defaulted to 500/400).
+        let utterance_end_ms = utterance_end_ms.max(MIN_UTTERANCE_END_MS);
         Self { api_key, language, endpointing_ms, utterance_end_ms }
     }
 
@@ -356,5 +361,22 @@ impl UnifiedSttSession {
             Self::Yandex(_) => {},
             Self::Whisper(s) => s.close(),
         }
+    }
+}
+
+#[cfg(test)]
+mod deepgram_params_tests {
+    use super::DeepgramStt;
+
+    #[test]
+    fn utterance_end_is_raised_to_the_api_minimum() {
+        // Deepgram rejects values below 1000 with HTTP 400; the app defaulted to 500 and 400.
+        assert_eq!(DeepgramStt::new("k".into(), "ru".into(), 200, 500).utterance_end_ms, 1000);
+        assert_eq!(DeepgramStt::new("k".into(), "ru".into(), 200, 400).utterance_end_ms, 1000);
+    }
+
+    #[test]
+    fn larger_utterance_end_is_kept() {
+        assert_eq!(DeepgramStt::new("k".into(), "en".into(), 200, 1500).utterance_end_ms, 1500);
     }
 }
