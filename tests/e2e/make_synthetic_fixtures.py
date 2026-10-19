@@ -5,10 +5,15 @@ are clean and robotic, so results are a ceiling for real speech, not a substitut
 
     python tests/e2e/make_synthetic_fixtures.py
     -> tests/e2e/fixtures/synthetic/*.wav and tests/e2e/phrases.synthetic.json
+
+    python tests/e2e/make_synthetic_fixtures.py --manifest tests/e2e/phrases.json
+    -> speaks the `text` of every phrase of that manifest into its `audio` path
+       (male voices: Microsoft Pavel for Russian, Microsoft Mark for English)
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import subprocess
@@ -67,25 +72,68 @@ foreach ($it in $items) {
 """
 
 
-def main() -> int:
+def speak(items: list, out_dir: Path) -> int:
+    """items: [{"id", "voice", "text"}]. Writes <id>.raw.wav files into out_dir."""
     shell = shutil.which("pwsh") or shutil.which("powershell")
     if not shell:
         print("PowerShell not found")
         return 2
-    OUT.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        (tmp_path / "items.json").write_text(
-            json.dumps([{"id": i, "voice": v, "text": t} for i, _, v, t, _ in PHRASES], ensure_ascii=False),
-            encoding="utf-8")
+        (tmp_path / "items.json").write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
         (tmp_path / "speak.ps1").write_text(PS_SCRIPT, encoding="utf-8-sig")
         r = subprocess.run(
             [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp_path / "speak.ps1"),
-             "-JsonPath", str(tmp_path / "items.json"), "-OutDir", str(OUT)],
+             "-JsonPath", str(tmp_path / "items.json"), "-OutDir", str(out_dir)],
             capture_output=True, text=True)
         if r.returncode != 0:
             print("speech synthesis failed:", r.stderr.strip() or r.stdout.strip())
             return 2
+    return 0
+
+
+def from_manifest(manifest_path: Path) -> int:
+    sys.path.insert(0, str(HERE))
+    from e2e.audio_utils import normalize_to_wav16k
+
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    langs = data.get("languages", {"my": "ru", "their": "en"})
+    voices = {"ru": "Microsoft Pavel", "en": "Microsoft Mark"}
+    items, targets = [], []
+    for ph in data["phrases"]:
+        lang = langs["my"] if ph["direction"] == "outgoing" else langs["their"]
+        if lang not in voices:
+            print(f"no voice for language '{lang}' ({ph['id']})")
+            return 2
+        target = (manifest_path.parent / ph["audio"]).with_suffix(".wav")
+        items.append({"id": ph["id"], "voice": voices[lang], "text": ph["text"]})
+        targets.append(target)
+    out_dir = targets[0].parent
+    if any(t.parent != out_dir for t in targets):
+        print("all audio paths must share one folder")
+        return 2
+    code = speak(items, out_dir)
+    if code:
+        return code
+    for ph, target in zip(data["phrases"], targets):
+        raw = out_dir / f"{ph['id']}.raw.wav"
+        duration = normalize_to_wav16k(raw, target)
+        raw.unlink()
+        print(f"{ph['id']}: {duration:.1f}s -> {target.name}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--manifest", help="speak the phrases of this manifest instead of the built-in set")
+    args = ap.parse_args()
+    if args.manifest:
+        return from_manifest(Path(args.manifest).resolve())
+
+    code = speak([{"id": i, "voice": v, "text": t} for i, _, v, t, _ in PHRASES], OUT)
+    if code:
+        return code
 
     sys.path.insert(0, str(HERE))
     from e2e.audio_utils import normalize_to_wav16k

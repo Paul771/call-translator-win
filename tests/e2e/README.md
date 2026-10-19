@@ -45,6 +45,10 @@ python tests/e2e/run_e2e.py --phrases tests/e2e/phrases.json
   `expected` – желаемый перевод (необязательно, нужен для сравнения с эталоном).
   Если `text` пропущен, эталоном станет расшифровка Deepgram, и отчёт пометит это как непроверенное.
 
+Если записывать нечем, озвучьте тексты голосами Windows (русский Microsoft Pavel, английский
+Microsoft Mark): `python tests/e2e/make_synthetic_fixtures.py --manifest tests/e2e/phrases.json`
+создаст файлы по путям `audio` из манифеста. Это синтетика, не ваш голос.
+
 ## Что проверяется
 
 | Проверка | Как считается | Порог |
