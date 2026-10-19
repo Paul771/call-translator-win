@@ -6,7 +6,8 @@
 //!            `inject_audio` command) and `null` playback device (audio discarded;
 //!            the TTS result still leaves the engine as `Event::TtsAudio`).
 //!   INPUTS:  16 kHz PCM WAV files, pipeline name, tail silence length.
-//!   OUTPUTS: `AudioChunk`s on the pipeline's capture channel, paced in real time.
+//!   OUTPUTS: `AudioChunk`s on the pipeline's capture channel, paced in real time and
+//!            continuous: silence is fed between phrases, like a live microphone.
 //!
 //! Selected by setting TRANSLATOR_MIC_DEVICE / TRANSLATOR_MEET_INPUT to `inject`
 //! and TRANSLATOR_SPEAKER_DEVICE / TRANSLATOR_MEET_OUTPUT to `null`.
@@ -17,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use log::{info, warn};
 
 use crate::audio::capture::AudioChunk;
@@ -36,19 +37,36 @@ const CHUNK_SAMPLES: usize = 320; // 20 ms at 16 kHz
 const CHUNK_MS: u64 = 20;
 
 // START_BLOCK_REGISTRY
-fn sources() -> &'static Mutex<HashMap<String, Sender<AudioChunk>>> {
-    static SOURCES: OnceLock<Mutex<HashMap<String, Sender<AudioChunk>>>> = OnceLock::new();
+/// One phrase to speak into a pipeline.
+struct Job {
+    samples: Vec<f32>,
+    tail_ms: u32,
+    direction: String,
+    event_tx: Sender<Event>,
+}
+
+fn sources() -> &'static Mutex<HashMap<String, Sender<Job>>> {
+    static SOURCES: OnceLock<Mutex<HashMap<String, Sender<Job>>>> = OnceLock::new();
     SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Called by a pipeline that opened the `inject` device.
+/// Called by a pipeline that opened the `inject` device. Starts the feeder thread, which
+/// streams audio to the pipeline for as long as the pipeline is registered.
 pub fn register(direction: &str, tx: Sender<AudioChunk>) {
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+    let spawned = std::thread::Builder::new()
+        .name(format!("inject-feed-{}", direction))
+        .spawn(move || run_feeder(tx, job_rx));
+    if spawned.is_err() {
+        warn!("[inject-{}] failed to spawn feeder thread", direction);
+        return;
+    }
     if let Ok(mut map) = sources().lock() {
-        map.insert(direction.to_string(), tx);
+        map.insert(direction.to_string(), job_tx);
     }
 }
 
-/// Called when the pipeline stops, so a stale sender is never reused.
+/// Called when the pipeline stops. Dropping the job sender ends the feeder thread.
 pub fn unregister(direction: &str) {
     if let Ok(mut map) = sources().lock() {
         map.remove(direction);
@@ -120,11 +138,11 @@ pub fn read_wav_mono_16k(path: &str) -> Result<Vec<f32>> {
 // END_BLOCK_WAV
 
 // START_BLOCK_FEEDER
-/// Push a WAV file into the named pipeline in real time, followed by silence.
-/// Returns the speech duration in seconds. The feeding runs on its own thread;
-/// `inject_speech_end` and `inject_done` log events mark its progress.
+/// Queue a WAV file for the named pipeline. The feeder speaks it in real time followed by
+/// `tail_ms` of silence and reports `inject_speech_end` / `inject_done` log events.
+/// Returns the speech duration in seconds.
 pub fn inject_wav(direction: &str, path: &str, tail_ms: u32, event_tx: Sender<Event>) -> Result<f32> {
-    let tx = sources()
+    let job_tx = sources()
         .lock()
         .ok()
         .and_then(|map| map.get(direction).cloned())
@@ -136,51 +154,71 @@ pub fn inject_wav(direction: &str, path: &str, tail_ms: u32, event_tx: Sender<Ev
         })?;
     let samples = read_wav_mono_16k(path)?;
     let seconds = samples.len() as f32 / INJECT_RATE as f32;
-    let dir = direction.to_string();
-
-    std::thread::Builder::new()
-        .name(format!("inject-{}", direction))
-        .spawn(move || {
-            let t0 = Instant::now();
-            let mut index: u64 = 0;
-            let mut push = |chunk: Vec<f32>| -> bool {
-                let deadline = t0 + Duration::from_millis(index * CHUNK_MS);
-                if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(wait);
-                }
-                index += 1;
-                let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
-                tx.send_timeout(AudioChunk { samples: chunk, raw_rms: rms }, Duration::from_secs(1)).is_ok()
-            };
-
-            for piece in samples.chunks(CHUNK_SAMPLES) {
-                let mut chunk = piece.to_vec();
-                chunk.resize(CHUNK_SAMPLES, 0.0);
-                if !push(chunk) {
-                    warn!("[inject-{}] pipeline closed while feeding", dir);
-                    return;
-                }
-            }
-            let _ = event_tx.try_send(Event::Log {
-                level: "info".into(),
-                message: format!("inject_speech_end {}", dir),
-            });
-
-            let tail_chunks = (tail_ms as u64 / CHUNK_MS).max(1);
-            for _ in 0..tail_chunks {
-                if !push(vec![0.0; CHUNK_SAMPLES]) {
-                    return;
-                }
-            }
-            let _ = event_tx.try_send(Event::Log {
-                level: "info".into(),
-                message: format!("inject_done {}", dir),
-            });
-            info!("[inject-{}] done", dir);
-        })
-        .context("failed to spawn inject thread")?;
-
+    job_tx
+        .send(Job { samples, tail_ms, direction: direction.to_string(), event_tx })
+        .map_err(|_| anyhow::anyhow!("inject feeder for '{}' has stopped", direction))?;
     Ok(seconds)
+}
+
+/// Real-time pacing on one continuous timeline, so idle silence and speech line up.
+struct Pacer {
+    t0: Instant,
+    index: u64,
+}
+
+impl Pacer {
+    /// Wait for this chunk's slot, then deliver it. `false` once the pipeline is gone.
+    fn push(&mut self, tx: &Sender<AudioChunk>, chunk: Vec<f32>) -> bool {
+        let deadline = self.t0 + Duration::from_millis(self.index * CHUNK_MS);
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        self.index += 1;
+        let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+        tx.send_timeout(AudioChunk { samples: chunk, raw_rms: rms }, Duration::from_secs(1)).is_ok()
+    }
+}
+
+/// A live microphone never stops streaming. Between phrases the feeder keeps sending
+/// silence, otherwise the recogniser sees a stream that stalls and restarts and
+/// finalizes utterances differently from the first one.
+fn run_feeder(tx: Sender<AudioChunk>, jobs: Receiver<Job>) {
+    let mut pacer = Pacer { t0: Instant::now(), index: 0 };
+    let silence = || vec![0.0f32; CHUNK_SAMPLES];
+    loop {
+        match jobs.try_recv() {
+            Ok(job) => {
+                for piece in job.samples.chunks(CHUNK_SAMPLES) {
+                    let mut chunk = piece.to_vec();
+                    chunk.resize(CHUNK_SAMPLES, 0.0);
+                    if !pacer.push(&tx, chunk) {
+                        warn!("[inject-{}] pipeline closed while feeding", job.direction);
+                        return;
+                    }
+                }
+                let _ = job.event_tx.try_send(Event::Log {
+                    level: "info".into(),
+                    message: format!("inject_speech_end {}", job.direction),
+                });
+                for _ in 0..(job.tail_ms as u64 / CHUNK_MS).max(1) {
+                    if !pacer.push(&tx, silence()) {
+                        return;
+                    }
+                }
+                let _ = job.event_tx.try_send(Event::Log {
+                    level: "info".into(),
+                    message: format!("inject_done {}", job.direction),
+                });
+                info!("[inject-{}] done", job.direction);
+            }
+            Err(TryRecvError::Empty) => {
+                if !pacer.push(&tx, silence()) {
+                    return;
+                }
+            }
+            Err(TryRecvError::Disconnected) => return,
+        }
+    }
 }
 // END_BLOCK_FEEDER
 
@@ -309,6 +347,47 @@ mod tests {
     fn rejects_non_wav() {
         let path = write_tmp("junk", b"not a wav file at all");
         assert!(read_wav_mono_16k(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn feeder_streams_silence_when_idle_and_speech_when_injected() {
+        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<AudioChunk>(256);
+        let (event_tx, event_rx) = crossbeam_channel::bounded::<Event>(16);
+        register("feeder-test", audio_tx);
+
+        // Idle: the very first chunk is silence, not nothing.
+        let first = audio_rx.recv_timeout(Duration::from_millis(500)).expect("idle silence");
+        assert!(first.samples.iter().all(|s| *s == 0.0));
+
+        // 0.1 s of a constant tone, then a short tail.
+        let path = write_tmp("feeder", &wav_bytes(16_000, 1, &vec![16384i16; 1600]));
+        let seconds = inject_wav("feeder-test", &path, 60, event_tx).unwrap();
+        assert!((seconds - 0.1).abs() < 1e-3);
+
+        let mut speech_chunks = 0;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut done = false;
+        while Instant::now() < deadline && !done {
+            while let Ok(chunk) = audio_rx.try_recv() {
+                if chunk.samples.iter().any(|s| (*s - 0.5).abs() < 1e-3) {
+                    speech_chunks += 1;
+                }
+            }
+            while let Ok(ev) = event_rx.try_recv() {
+                if let Event::Log { message, .. } = ev {
+                    done |= message.starts_with("inject_done");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done, "inject_done was never reported");
+        assert_eq!(speech_chunks, 5, "0.1 s at 20 ms chunks");
+
+        // Silence keeps flowing afterwards.
+        while audio_rx.try_recv().is_ok() {}
+        assert!(audio_rx.recv_timeout(Duration::from_millis(500)).is_ok());
+        unregister("feeder-test");
         let _ = std::fs::remove_file(path);
     }
 
