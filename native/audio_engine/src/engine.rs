@@ -785,8 +785,13 @@ fn run_pipeline(
 
     let mut tts: Option<TtsEngine> = None;
     let mut segmenter = crate::pipeline::segmenter::TextSegmenter::new();
+    // TRANSLATOR_MIN_SEGMENT_WORDS=1 turns the merging of short fragments off.
+    let min_segment_words = std::env::var("TRANSLATOR_MIN_SEGMENT_WORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(crate::pipeline::segmenter::MIN_SEGMENT_WORDS);
     let mut joiner = crate::pipeline::segmenter::FragmentJoiner::new(
-        crate::pipeline::segmenter::MIN_SEGMENT_WORDS,
+        min_segment_words,
         crate::pipeline::segmenter::QUIET_BEFORE_RELEASE,
         crate::pipeline::segmenter::MAX_HOLD,
     );
@@ -955,6 +960,7 @@ fn run_pipeline(
     // stayed up for STABLE_SESSION_SECS starts a new incident; shorter sessions
     // keep accumulating toward MAX_DEEPGRAM_DROPS.
     let mut session_started = Instant::now();
+    const VOICE_RAW_RMS: f32 = 0.01;
     const MAX_DEEPGRAM_DROPS: u32 = 3;
     const STABLE_SESSION_SECS: u64 = 60;
     const MAX_BACKOFF_MS: u64 = 30000;
@@ -1098,6 +1104,12 @@ fn run_pipeline(
             // by this capture device, so its audio must not reach STT.
             if my_suppress.load(Ordering::SeqCst) {
                 continue;
+            }
+            // Speech heard right now postpones the release of a held short fragment:
+            // the recogniser only reports the continuation about a second later.
+            // raw_rms is measured before the capture gain, so room noise stays below it.
+            if chunk.raw_rms > VOICE_RAW_RMS {
+                activity.store(activity_base.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
             }
             let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
             let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
