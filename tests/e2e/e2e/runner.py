@@ -69,6 +69,28 @@ class RunOptions:
     thresholds: Thresholds = field(default_factory=Thresholds)
 
 
+AUDIO_EXTS = (".wav", ".m4a", ".mp3", ".ogg", ".opus", ".flac", ".aac", ".wma", ".mp4", ".webm")
+
+
+def resolve_audio(base: Path, spec: str) -> Path:
+    """Find the recording for a manifest entry.
+
+    `spec` may omit the extension, and `en-` / `eng-` file names are treated alike,
+    so ``fixtures/user/en-01`` finds ``Eng-01.m4a``. Unresolved specs are returned
+    as-is so the caller reports exactly which file is missing.
+    """
+    target = (base / spec)
+    if target.is_file():
+        return target.resolve()
+    folder, stem = target.parent, target.stem.lower()
+    names = {stem, stem.replace("en-", "eng-", 1), stem.replace("eng-", "en-", 1)}
+    if folder.is_dir():
+        for f in sorted(folder.iterdir()):
+            if f.is_file() and f.suffix.lower() in AUDIO_EXTS and f.stem.lower() in names:
+                return f.resolve()
+    return target.resolve()
+
+
 def load_manifest(path: Path) -> tuple:
     data = json.loads(path.read_text(encoding="utf-8"))
     langs = data.get("languages", {})
@@ -77,7 +99,7 @@ def load_manifest(path: Path) -> tuple:
         phrases.append(Phrase(
             id=item["id"],
             direction=item["direction"],
-            audio=(path.parent / item["audio"]).resolve(),
+            audio=resolve_audio(path.parent, item["audio"]),
             text=item.get("text"),
             expected=item.get("expected"),
         ))
