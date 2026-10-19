@@ -168,7 +168,16 @@ impl PiperTts {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&input_path, text).context("Failed to write phonemizer input file")?;
+        // create_new: never overwrite an existing file or follow a pre-planted link at this name.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&input_path)
+                .context("Failed to create phonemizer input file")?;
+            file.write_all(text.as_bytes()).context("Failed to write phonemizer input file")?;
+        }
         let result = Command::new(&self.espeak_binary)
             .args(["-q", "--ipa=2", "-v", &self.config.espeak.voice, "-f"])
             .arg(&input_path)
