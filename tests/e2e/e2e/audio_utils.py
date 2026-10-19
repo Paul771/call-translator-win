@@ -54,6 +54,12 @@ def write_pcm16_wav(path: Path, pcm: bytes, rate: int = RATE) -> None:
         w.writeframes(pcm)
 
 
+def tts_event_seconds(ev) -> float:
+    """Duration of one `tts_audio` event (base64 PCM16)."""
+    rate = int(ev.data.get("sample_rate", RATE))
+    return len(base64.b64decode(ev.data.get("audio_b64", ""))) / 2 / rate
+
+
 def tts_events_to_wav(tts_events: list, path: Path, gap_ms: int = 250, pad_ms: int = 500) -> float:
     """Concatenate engine `tts_audio` events (base64 PCM16) into one WAV.
 

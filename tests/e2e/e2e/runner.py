@@ -42,6 +42,7 @@ class Thresholds:
     expected_chrf: float = 0.45    # translation vs. the reference translation
     back_chrf: float = 0.40        # round-trip text vs. what was said
     last_audio_s: float = 15.0     # end of speech -> end of synthesized audio
+    min_clip_s: float = 0.25       # shortest acceptable spoken fragment (a 'hi' of 0.15 s is a blip)
 
 
 @dataclass
@@ -312,6 +313,7 @@ class Runner:
             res["first_audio_s"] = round(tts_events[0].ts - speech_end, 2)
             res["last_audio_s"] = round(tts_events[-1].ts - speech_end, 2)
 
+        res["tts_clip_seconds"] = [round(audio_utils.tts_event_seconds(e), 2) for e in tts_events]
         res["translation_text"] = " ".join(e.data["text"] for e in translations).strip()
         wav_out = self.opts.out_dir / "tts" / f"{res['tts_name']}.wav"
         res["tts_audio_s"] = round(audio_utils.tts_events_to_wav(tts_events, wav_out), 2)
@@ -367,6 +369,9 @@ class Runner:
             except RuntimeError as e:
                 fails.append(f"tts re-transcription failed: {e}")
 
+        clipped = [c for c in res.get("tts_clip_seconds", []) if c < t.min_clip_s]
+        if clipped:
+            fails.append(f"clipped speech fragment(s) {clipped}s < {t.min_clip_s}s (one-word segments spoken alone)")
         if "last_audio_s" in res and res["last_audio_s"] > t.last_audio_s:
             fails.append(f"audio ended {res['last_audio_s']}s after speech > {t.last_audio_s}s")
         if res["engine_errors"]:
