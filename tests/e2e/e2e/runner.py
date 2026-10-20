@@ -62,6 +62,8 @@ class RunOptions:
     endpointing_ms: Optional[int] = None
     utterance_end_ms: int = 1000
     repeat: int = 1
+    translation_provider: Optional[str] = None  # groq | yandex | litellm | auto
+    groq_model: Optional[str] = None
     tail_ms: int = 2500
     settle_s: float = 5.0
     max_wait_s: float = 40.0
@@ -118,7 +120,7 @@ def build_engine_env(cfg: ProjectConfig, my_lang: str, their_lang: str, opts: Ru
         "GROQ_API_KEY": cfg.secrets.groq,
         "YANDEX_API_KEY": cfg.secrets.yandex,
         "YANDEX_FOLDER_ID": cfg.env.get("YANDEX_FOLDER_ID") or s.get("yandex_folder_id", ""),
-        "TRANSLATOR_PROVIDER": s.get("translation_provider", "auto"),
+        "TRANSLATOR_PROVIDER": opts.translation_provider or s.get("translation_provider", "auto"),
         "STT_PROVIDER": opts.stt_provider,
         "TRANSLATOR_MODELS_DIR": str(models),
         "TRANSLATOR_TTS_EN_MODEL": str(models / "piper-en" / f"{en_voice}.onnx"),
@@ -137,6 +139,8 @@ def build_engine_env(cfg: ProjectConfig, my_lang: str, their_lang: str, opts: Ru
         "TRANSLATOR_SPEAKER_DEVICE": "null",
         "TRANSLATOR_MEET_OUTPUT": "null",
     })
+    if opts.groq_model:
+        env["GROQ_MODEL"] = opts.groq_model
     if cfg.env.get("ORT_DYLIB_PATH"):
         env["ORT_DYLIB_PATH"] = cfg.env["ORT_DYLIB_PATH"]
     return env

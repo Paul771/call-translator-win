@@ -48,6 +48,9 @@ def main() -> int:
                     help="Deepgram utterance_end_ms (default 1000; values below 1000 are rejected by the API)")
     ap.add_argument("--repeat", type=int, default=1,
                     help="run every phrase N times: streaming STT varies, repeats separate flaky from systematic")
+    ap.add_argument("--translation-provider", choices=["auto", "groq", "yandex", "litellm"],
+                    help="force one translation provider (default: from settings.json, normally auto)")
+    ap.add_argument("--groq-model", help="Groq model for the engine (GROQ_MODEL)")
     ap.add_argument("--skip-ref-asr", action="store_true", help="skip the Deepgram reference transcript")
     ap.add_argument("--skip-back", action="store_true", help="skip the back-translation check")
     ap.add_argument("--out", help="output directory (default tests/e2e/results/<timestamp>)")
@@ -86,6 +89,8 @@ def main() -> int:
         endpointing_ms=args.endpointing_ms,
         utterance_end_ms=args.utterance_end_ms,
         repeat=max(1, args.repeat),
+        translation_provider=args.translation_provider,
+        groq_model=args.groq_model,
         skip_ref_asr=args.skip_ref_asr,
         skip_back=args.skip_back,
         thresholds=Thresholds(),
