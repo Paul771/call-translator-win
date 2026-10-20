@@ -7,6 +7,48 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::sync::Arc;
 
+fn new_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client")
+}
+
+/// Groq sometimes answers a valid request with a bare `{"error":{"message":"Not Found"}}`.
+/// It is a property of the connection (a keep-alive connection pinned to a bad node fails
+/// every request, a new one usually works), not of the request. A genuinely missing model
+/// says "does not exist" / `model_not_found` and must not be retried.
+fn is_transient_not_found(status: u16, body: &str) -> bool {
+    status == 404 && !body.contains("does not exist") && !body.contains("model_not_found")
+}
+
+/// Groq model used for translation unless GROQ_MODEL says otherwise. Groq retires models
+/// without notice (llama-3.1-8b-instant and llama-3.3-70b-versatile now answer
+/// `model_not_found`), which is why the model is configurable.
+const DEFAULT_GROQ_MODEL: &str = "openai/gpt-oss-20b";
+
+/// Chat-completions body for one translation. Reasoning models (gpt-oss) spend completion
+/// tokens on thinking before the answer, so they get `reasoning_effort: low` and a larger
+/// budget; with the old 40 tokens they return an empty reply.
+fn groq_request_body(model: &str, system_prompt: &str, text: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": text}
+        ],
+        "max_tokens": 40,
+        "temperature": 0.1
+    });
+    if model.starts_with("openai/gpt-oss") {
+        body["reasoning_effort"] = serde_json::json!("low");
+        body["max_tokens"] = serde_json::json!(400);
+    }
+    body
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationDirection {
     pub from_code: String,
@@ -54,6 +96,7 @@ fn lang_name(code: &str) -> &str {
 #[derive(Clone)]
 pub struct TranslationEngine {
     groq_key: String,
+    groq_model: String,
     yandex_key: String,
     yandex_folder_id: String,
     litellm_base_url: String,
@@ -61,6 +104,8 @@ pub struct TranslationEngine {
     litellm_model: String,
     provider: String,
     client: reqwest::blocking::Client,
+    /// Used for Groq only; replaced by a fresh connection when Groq answers a transient 404.
+    groq_client: Arc<std::sync::Mutex<reqwest::blocking::Client>>,
     yandex: Arc<std::sync::OnceLock<yandex::YandexTranslator>>,
     litellm: Arc<std::sync::OnceLock<litellm::LiteLlmTranslator>>,
     #[cfg(feature = "local-mt")]
@@ -78,7 +123,12 @@ impl TranslationEngine {
                litellm_base_url: &str, litellm_api_key: &str, litellm_model: &str,
                #[cfg(feature = "local-mt")] mt_ruen_path: &str,
                #[cfg(feature = "local-mt")] mt_enru_path: &str) -> Result<Self> {
-        eprintln!("[TRANSLATION] Provider: '{}'", provider);
+        let groq_model = std::env::var("GROQ_MODEL")
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| DEFAULT_GROQ_MODEL.to_string());
+        eprintln!("[TRANSLATION] Provider: '{}', Groq model: '{}'", provider, groq_model);
         eprintln!("[TRANSLATION] Using GROQ_API_KEY: {}... (len={})",
             if groq_key.len() > 4 { &groq_key[..4] } else { "?" },
             groq_key.len());
@@ -90,14 +140,11 @@ impl TranslationEngine {
         #[cfg(feature = "local-mt")]
         eprintln!("[TRANSLATION] Local MT: ru->en='{}', en->ru='{}'",
             mt_ruen_path, mt_enru_path);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to build HTTP client")?;
+        let client = new_http_client()?;
+        let groq_client = Arc::new(std::sync::Mutex::new(new_http_client()?));
         Ok(Self {
             groq_key: groq_key.to_string(),
+            groq_model,
             yandex_key: yandex_key.to_string(),
             yandex_folder_id: yandex_folder_id.to_string(),
             litellm_base_url: litellm_base_url.to_string(),
@@ -105,6 +152,7 @@ impl TranslationEngine {
             litellm_model: litellm_model.to_string(),
             provider: provider.to_string(),
             client,
+            groq_client,
             yandex: Arc::new(std::sync::OnceLock::new()),
             litellm: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "local-mt")]
@@ -273,44 +321,31 @@ impl TranslationEngine {
             to = direction.to_name,
         );
 
-        let model = "llama-3.1-8b-instant";
-
-        let body = serde_json::json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": text}
-            ],
-            "max_tokens": 40,
-            "temperature": 0.1
-        });
-
+        let model = self.groq_model.as_str();
+        let body = groq_request_body(model, &system_prompt, text);
         let body_string = serde_json::to_string(&body).unwrap_or_default();
 
-        let debug_line = format!(
-            "🔑 KEY={}...{} (len={})\n📡 GROQ req: model={}, text={}",
-            &self.groq_key[..4.min(self.groq_key.len())],
-            &self.groq_key[32..36.min(self.groq_key.len())],
-            self.groq_key.len(),
-            model,
-            text,
-        );
+        // No key characters in the log: only the model and the text.
+        let debug_line = format!("📡 GROQ req: model={}, text={}", model, text);
         eprintln!("{}", debug_line);
         log_to_file("groq_debug.log", &debug_line);
 
         // Retry loop: 3 attempts with exponential backoff (1s, 2s, 4s)
         let max_attempts = 3;
         let mut last_error = None;
+        let mut last_was_transient_404 = false;
         for attempt in 1..=max_attempts {
             if attempt > 1 {
-                let delay_ms = 1000u64 * 2u64.pow(attempt as u32 - 2);
+                // A transient 404 needs a new connection, not a long wait.
+                let delay_ms = if last_was_transient_404 { 100 } else { 1000u64 * 2u64.pow(attempt as u32 - 2) };
                 let retry_msg = format!("🔁 GROQ retry #{}/{} after {}ms", attempt, max_attempts, delay_ms);
                 eprintln!("{}", retry_msg);
                 log_to_file("groq_debug.log", &retry_msg);
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             }
 
-            let response = self.client
+            let client = self.groq_client.lock().map(|c| c.clone()).unwrap_or_else(|_| self.client.clone());
+            let response = client
                 .post("https://api.groq.com/openai/v1/chat/completions")
                 .header("Authorization", format!("Bearer {}", self.groq_key))
                 .header("Content-Type", "application/json; charset=utf-8")
@@ -334,10 +369,15 @@ impl TranslationEngine {
                     };
 
                     let translated = groq_resp.choices.into_iter().next()
-                        .map(|c| c.message.content.trim().to_string())
+                        .and_then(|c| c.message.content)
+                        .map(|c| c.trim().to_string())
                         .unwrap_or_default()
                         .replace("<think>", "")
                         .replace("</think>", "");
+                    if translated.trim().is_empty() {
+                        // A reasoning model that ran out of tokens answers with nothing.
+                        bail!("Groq returned an empty translation (model {})", model);
+                    }
 
                     let translated = clean_groq_output(&translated);
 
@@ -354,7 +394,13 @@ impl TranslationEngine {
                     let err_line = format!("❌ GROQ error {}: {}", status, body_text);
                     eprintln!("{}", err_line);
                     log_to_file("groq_debug.log", &err_line);
-                    if status.as_u16() >= 400 && status.as_u16() < 500 {
+                    last_was_transient_404 = is_transient_not_found(status.as_u16(), &body_text);
+                    if last_was_transient_404 {
+                        // Drop the pooled connection: the next attempt (and later calls) start fresh.
+                        if let (Ok(mut slot), Ok(fresh)) = (self.groq_client.lock(), new_http_client()) {
+                            *slot = fresh;
+                        }
+                    } else if status.as_u16() >= 400 && status.as_u16() < 500 {
                         bail!("Groq error {}: {}", status, body_text);
                     }
                     last_error = Some(anyhow::anyhow!("Groq error {}: {}", status, body_text));
@@ -463,5 +509,47 @@ struct GroqChoice {
 
 #[derive(Deserialize)]
 struct GroqMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[cfg(test)]
+mod groq_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_models_get_effort_and_a_larger_budget() {
+        let body = groq_request_body("openai/gpt-oss-20b", "sys", "привет");
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["max_tokens"], 400);
+        assert_eq!(body["model"], "openai/gpt-oss-20b");
+        assert_eq!(body["messages"][1]["content"], "привет");
+    }
+
+    #[test]
+    fn other_models_keep_the_short_budget_and_no_reasoning_field() {
+        let body = groq_request_body("llama-3.1-8b-instant", "sys", "hi");
+        assert_eq!(body["max_tokens"], 40);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn null_or_missing_content_does_not_break_parsing() {
+        let null: GroqResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":null,"reasoning":"x"}}]}"#).unwrap();
+        assert!(null.choices[0].message.content.is_none());
+        let ok: GroqResponse = serde_json::from_str(r#"{"choices":[{"message":{"content":"hello"}}]}"#).unwrap();
+        assert_eq!(ok.choices[0].message.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_bare_not_found_is_transient_but_a_missing_model_is_not() {
+        assert!(is_transient_not_found(404, r#"{"error":{"message":"Not Found"}}"#));
+        assert!(!is_transient_not_found(
+            404,
+            r#"{"error":{"message":"The model `x` does not exist or you do not have access to it.","code":"model_not_found"}}"#
+        ));
+        assert!(!is_transient_not_found(401, r#"{"error":{"message":"Invalid API Key"}}"#));
+        assert!(!is_transient_not_found(400, r#"{"error":{"message":"Not Found"}}"#));
+    }
 }
