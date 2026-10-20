@@ -24,6 +24,14 @@ fn is_transient_not_found(status: u16, body: &str) -> bool {
     status == 404 && !body.contains("does not exist") && !body.contains("model_not_found")
 }
 
+/// System prompt for Groq translation. Kept in a file so tests/e2e/prompt_eval.py scores the very
+/// text the engine sends. Placeholders: {from}, {to} (language names).
+const GROQ_PROMPT: &str = include_str!("groq_prompt.txt");
+
+fn groq_system_prompt(from_name: &str, to_name: &str) -> String {
+    GROQ_PROMPT.trim().replace("{from}", from_name).replace("{to}", to_name)
+}
+
 /// Groq model used for translation unless GROQ_MODEL says otherwise. Groq retires models
 /// without notice (llama-3.1-8b-instant and llama-3.3-70b-versatile now answer
 /// `model_not_found`), which is why the model is configurable.
@@ -307,19 +315,7 @@ impl TranslationEngine {
     }
 
     fn translate_groq(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
-        let system_prompt = format!(
-            "You are a machine translation API. \
-             Your ONLY output is the {to} translation of the user's {from} text. \
-             No explanations. No greetings. No disclaimers. \
-             Just the translation, word for word.\n\
-             Examples:\n\
-             User: привет как дела\n\
-             Assistant: hello how are you\n\
-             User: мне нужна помощь\n\
-             Assistant: i need help",
-            from = direction.from_name,
-            to = direction.to_name,
-        );
+        let system_prompt = groq_system_prompt(&direction.from_name, &direction.to_name);
 
         let model = self.groq_model.as_str();
         let body = groq_request_body(model, &system_prompt, text);
@@ -370,16 +366,13 @@ impl TranslationEngine {
 
                     let translated = groq_resp.choices.into_iter().next()
                         .and_then(|c| c.message.content)
-                        .map(|c| c.trim().to_string())
-                        .unwrap_or_default()
-                        .replace("<think>", "")
-                        .replace("</think>", "");
+                        .map(|c| clean_groq_output(&c))
+                        .unwrap_or_default();
                     if translated.trim().is_empty() {
                         // A reasoning model that ran out of tokens answers with nothing.
                         bail!("Groq returned an empty translation (model {})", model);
                     }
 
-                    let translated = clean_groq_output(&translated);
 
                     let out_line = format!("✅ GROQ Output: {}", translated);
                     eprintln!("{}", out_line);
@@ -436,53 +429,55 @@ impl TranslationEngine {
     }
 }
 
+/// Tidy a model reply without ever rewriting what was translated. (The old version guessed at
+/// "verbose" replies and cut real translations: anything containing "okay", "first," or a pair of
+/// quotation marks lost words.)
 fn clean_groq_output(text: &str) -> String {
-    let t = text.trim();
-    // Pattern: "something" translates to "translation"
-    if let Some(pos) = t.to_lowercase().find("translates to") {
-        let after = &t[pos + "translates to".len()..];
-        // Extract text between quotes
-        if let Some(start) = after.find('"') {
-            let rest = &after[start + 1..];
-            if let Some(end) = rest.find('"') {
-                return rest[..end].to_string();
-            }
+    let mut t = text.to_string();
+
+    // A reasoning model may leave a <think>...</think> block in the content.
+    while let (Some(open), Some(close)) = (t.find("<think>"), t.find("</think>")) {
+        if close < open {
+            break;
         }
-        // Or first sentence after "translates to"
-        let first_sentence = after.split(|c| c == '.' || c == '!' || c == '?')
-            .next().unwrap_or("").trim().trim_matches('"');
-        if !first_sentence.is_empty() {
-            return first_sentence.to_string();
+        t.replace_range(open..close + "</think>".len(), "");
+    }
+    let mut t = t.replace("<think>", "").replace("</think>", "");
+
+    // Replies are single-line text for the speech synthesiser.
+    t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // A leading label such as "Translation:" or "Перевод:".
+    for label in ["translation:", "перевод:", "translated:"] {
+        if t.to_lowercase().starts_with(label) {
+            t = t.chars().skip(label.chars().count()).collect::<String>().trim().to_string();
+            break;
         }
     }
-    // Pattern: starts with "Russian phrase" (quoted), extract the last quoted English
-    let parts: Vec<&str> = t.split('"').collect();
-    if parts.len() >= 3 {
-        // Try last quoted segment
-        if let Some(last) = parts.last() {
-            let candidate = last.trim();
-            if !candidate.is_empty() && candidate.len() < 100 {
-                return candidate.to_string();
+
+    // One pair of quotes around the whole reply is formatting, not part of the translation.
+    let pairs = [('"', '"'), ('\'', '\''), ('\u{ab}', '\u{bb}'), ('\u{201c}', '\u{201d}')];
+    for (open, close) in pairs {
+        if t.chars().count() >= 2 && t.starts_with(open) && t.ends_with(close) {
+            let inner: String = t.chars().skip(1).take(t.chars().count() - 2).collect();
+            if !inner.contains(open) && !inner.contains(close) {
+                t = inner.trim().to_string();
             }
+            break;
         }
     }
-    // If output contains verbose patterns, strip first sentence
-    let verbose_patterns = ["okay", "let's see", "the user said", "the user wrote",
-                            "translates to", "breaking it down", "first,", "i need to",
-                            "putting it together", "let me break"];
-    let lower = t.to_lowercase();
-    if verbose_patterns.iter().any(|p| lower.contains(p)) {
-        let sentences: Vec<&str> = t.split(|c| c == '.' || c == '!' || c == '?')
-            .map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        for s in sentences.iter().rev() {
-            let sl = s.to_lowercase();
-            if !verbose_patterns.iter().any(|p| sl.contains(p)) && !s.contains('"') {
-                return s.trim().to_string();
-            }
-        }
-        return sentences.last().unwrap_or(&"").trim().to_string();
-    }
-    t.to_string()
+
+    // Typographic characters that the speech synthesiser reads wrongly or skips.
+    t.chars()
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' => '\'',
+            '\u{2011}' | '\u{2010}' => '-',
+            '\u{a0}' | '\u{202f}' | '\u{2009}' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn log_to_file(filename: &str, line: &str) {
@@ -551,5 +546,39 @@ mod groq_tests {
         ));
         assert!(!is_transient_not_found(401, r#"{"error":{"message":"Invalid API Key"}}"#));
         assert!(!is_transient_not_found(400, r#"{"error":{"message":"Not Found"}}"#));
+    }
+
+    #[test]
+    fn prompt_names_both_languages_and_keeps_no_placeholders() {
+        let prompt = groq_system_prompt("Russian", "English");
+        assert!(prompt.contains("Russian to English"));
+        assert!(!prompt.contains("{from}") && !prompt.contains("{to}"));
+        assert!(!prompt.contains("word for word"), "the old prompt produced word-for-word grammar");
+    }
+
+    #[test]
+    fn real_translations_are_not_rewritten() {
+        // The old cleaner dropped "Okay." and cut text around quotation marks.
+        assert_eq!(clean_groq_output("Okay. Let's meet at three."), "Okay. Let's meet at three.");
+        assert_eq!(clean_groq_output("First, we need to check the numbers."), "First, we need to check the numbers.");
+        assert_eq!(clean_groq_output(r#"He said "yes" and left."#), r#"He said "yes" and left."#);
+        assert_eq!(clean_groq_output("Он сказал «да» и ушёл."), "Он сказал «да» и ушёл.");
+    }
+
+    #[test]
+    fn formatting_around_the_reply_is_removed() {
+        assert_eq!(clean_groq_output(r#""Good afternoon.""#), "Good afternoon.");
+        assert_eq!(clean_groq_output("«Добрый день.»"), "Добрый день.");
+        assert_eq!(clean_groq_output("Translation: Good afternoon."), "Good afternoon.");
+        assert_eq!(clean_groq_output("Перевод: Добрый день."), "Добрый день.");
+        assert_eq!(clean_groq_output("<think>hmm</think>Good afternoon."), "Good afternoon.");
+        assert_eq!(clean_groq_output("  Good\n afternoon.  "), "Good afternoon.");
+    }
+
+    #[test]
+    fn typography_the_voice_reads_wrongly_is_normalised() {
+        assert_eq!(clean_groq_output("Let\u{2019}s go"), "Let's go");
+        assert_eq!(clean_groq_output("бизнес\u{2011}приложения"), "бизнес-приложения");
+        assert_eq!(clean_groq_output("в\u{a0}три часа"), "в три часа");
     }
 }

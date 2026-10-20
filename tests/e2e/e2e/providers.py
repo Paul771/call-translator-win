@@ -143,10 +143,11 @@ def deepgram_transcribe(wav_path: Path, language: str, key: str, timeout: int = 
 # ---------------------------------------------------------------------------
 
 def groq_chat(messages: list, key: str, temperature: float = 0.0, max_tokens: int = 300,
-              json_mode: bool = False, retries: int = 4, timeout: int = 30) -> str:
+              json_mode: bool = False, retries: int = 4, timeout: int = 30,
+              model: Optional[str] = None, reasoning_effort: str = "low") -> str:
     if not key:
         raise RuntimeError("no Groq key")
-    model = _active["model"]
+    model = model or _active["model"]
     body = {
         "model": model,
         "messages": messages,
@@ -155,7 +156,7 @@ def groq_chat(messages: list, key: str, temperature: float = 0.0, max_tokens: in
     }
     if model.startswith("openai/gpt-oss"):
         # Reasoning models spend completion tokens on thinking; leave room for the answer.
-        body["reasoning_effort"] = "low"
+        body["reasoning_effort"] = reasoning_effort
         body["max_tokens"] = max(max_tokens, 600)
     if json_mode:
         body["response_format"] = {"type": "json_object"}
