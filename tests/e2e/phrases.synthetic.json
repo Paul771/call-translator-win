@@ -1,0 +1,78 @@
+{
+  "languages": {
+    "my": "ru",
+    "their": "en"
+  },
+  "phrases": [
+    {
+      "id": "ru-01",
+      "direction": "outgoing",
+      "audio": "fixtures/synthetic/ru-01.wav",
+      "text": "Добрый день, меня зовут Павел, рад познакомиться.",
+      "expected": "Good afternoon, my name is Pavel, nice to meet you."
+    },
+    {
+      "id": "ru-02",
+      "direction": "outgoing",
+      "audio": "fixtures/synthetic/ru-02.wav",
+      "text": "Можете повторить, пожалуйста, я не расслышал последнее предложение.",
+      "expected": "Could you please repeat that, I didn't catch the last sentence."
+    },
+    {
+      "id": "ru-03",
+      "direction": "outgoing",
+      "audio": "fixtures/synthetic/ru-03.wav",
+      "text": "Давайте перенесём встречу на пятницу в три часа дня.",
+      "expected": "Let's move the meeting to Friday at three in the afternoon."
+    },
+    {
+      "id": "ru-04",
+      "direction": "outgoing",
+      "audio": "fixtures/synthetic/ru-04.wav",
+      "text": "Мы отправили вам коммерческое предложение по электронной почте.",
+      "expected": "We sent you the commercial proposal by email."
+    },
+    {
+      "id": "ru-05",
+      "direction": "outgoing",
+      "audio": "fixtures/synthetic/ru-05.wav",
+      "text": "Спасибо за звонок, до свидания.",
+      "expected": "Thank you for calling, goodbye."
+    },
+    {
+      "id": "en-01",
+      "direction": "incoming",
+      "audio": "fixtures/synthetic/en-01.wav",
+      "text": "Hello, can you hear me clearly?",
+      "expected": "Здравствуйте, вы хорошо меня слышите?"
+    },
+    {
+      "id": "en-02",
+      "direction": "incoming",
+      "audio": "fixtures/synthetic/en-02.wav",
+      "text": "Our team will finish the project by the end of next month.",
+      "expected": "Наша команда закончит проект к концу следующего месяца."
+    },
+    {
+      "id": "en-03",
+      "direction": "incoming",
+      "audio": "fixtures/synthetic/en-03.wav",
+      "text": "I would like to discuss the budget for the next quarter.",
+      "expected": "Я хотел бы обсудить бюджет на следующий квартал."
+    },
+    {
+      "id": "en-04",
+      "direction": "incoming",
+      "audio": "fixtures/synthetic/en-04.wav",
+      "text": "Please send me the contract before Thursday.",
+      "expected": "Пожалуйста, отправьте мне договор до четверга."
+    },
+    {
+      "id": "en-05",
+      "direction": "incoming",
+      "audio": "fixtures/synthetic/en-05.wav",
+      "text": "That sounds great, let's talk again tomorrow.",
+      "expected": "Отлично, давайте поговорим снова завтра."
+    }
+  ]
+}

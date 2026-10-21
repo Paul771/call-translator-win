@@ -57,8 +57,19 @@
         <type-AudioCapture PURPOSE="WASAPI input capture" />
         <type-AudioPlayback PURPOSE="WASAPI output playback" />
         <type-LoopbackCapture PURPOSE="WASAPI loopback from output device" />
+        <type-Playback PURPOSE="audio/inject.rs: output device or null sink (test mode)" />
+        <fn-inject_wav PURPOSE="audio/inject.rs: feed a 16 kHz WAV into a pipeline whose capture device is 'inject' (command inject_audio)" />
       </annotations>
     </M-AUDIO>
+
+    <M-E2E NAME="EndToEndTest" TYPE="TEST_HARNESS" STATUS="implemented">
+      <purpose>Feed recorded phrases through the real engine (no mic/speakers) and score STT, translation, TTS and latency</purpose>
+      <path>tests/e2e/</path>
+      <depends>M-ENGINE, M-AUDIO</depends>
+      <annotations>
+        <fn-run_e2e PURPOSE="tests/e2e/run_e2e.py: CLI entry point; spawns audio_engine.exe per direction" />
+      </annotations>
+    </M-E2E>
 
     <M-ELIXIR NAME="ElixirOrchestrator" TYPE="ENTRY_POINT" STATUS="implemented">
       <purpose>Elixir GenServer + TCP command server</purpose>

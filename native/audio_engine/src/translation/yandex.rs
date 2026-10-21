@@ -41,7 +41,7 @@ impl YandexTranslator {
 
         eprintln!("[YANDEX] Translating: {} -> {}: {}",
             source_lang, target_lang,
-            if text.len() > 50 { &text[..50] } else { text });
+            preview(text));
 
         let response = self.client
             .post("https://translate.api.cloud.yandex.net/translate/v2/translate")
@@ -90,4 +90,29 @@ struct YandexResponse {
 #[derive(Deserialize)]
 struct YandexTranslation {
     text: String,
+}
+
+/// First 50 characters of `text` for log lines. Cuts on character boundaries:
+/// a byte slice (`&text[..50]`) panics inside multi-byte Cyrillic text.
+fn preview(text: &str) -> String {
+    text.chars().take(50).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview;
+
+    #[test]
+    fn preview_keeps_short_cyrillic_text() {
+        // 31 characters, 56 bytes: byte 50 falls inside 'д' (regression: panicked here).
+        let text = "встречу на пятницу в 3 часа дня";
+        assert!(text.len() > 50);
+        assert_eq!(preview(text), text);
+    }
+
+    #[test]
+    fn preview_truncates_long_text_by_characters() {
+        let text = "я".repeat(80);
+        assert_eq!(preview(&text).chars().count(), 50);
+    }
 }

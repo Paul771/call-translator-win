@@ -7,6 +7,56 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::sync::Arc;
 
+fn new_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client")
+}
+
+/// Groq sometimes answers a valid request with a bare `{"error":{"message":"Not Found"}}`.
+/// It is a property of the connection (a keep-alive connection pinned to a bad node fails
+/// every request, a new one usually works), not of the request. A genuinely missing model
+/// says "does not exist" / `model_not_found` and must not be retried.
+fn is_transient_not_found(status: u16, body: &str) -> bool {
+    status == 404 && !body.contains("does not exist") && !body.contains("model_not_found")
+}
+
+/// System prompt for Groq translation. Kept in a file so tests/e2e/prompt_eval.py scores the very
+/// text the engine sends. Placeholders: {from}, {to} (language names).
+const GROQ_PROMPT: &str = include_str!("groq_prompt.txt");
+
+fn groq_system_prompt(from_name: &str, to_name: &str) -> String {
+    GROQ_PROMPT.trim().replace("{from}", from_name).replace("{to}", to_name)
+}
+
+/// Groq model used for translation unless GROQ_MODEL says otherwise. Groq retires models
+/// without notice (llama-3.1-8b-instant and llama-3.3-70b-versatile now answer
+/// `model_not_found`), which is why the model is configurable.
+const DEFAULT_GROQ_MODEL: &str = "openai/gpt-oss-20b";
+
+/// Chat-completions body for one translation. Reasoning models (gpt-oss) spend completion
+/// tokens on thinking before the answer, so they get `reasoning_effort: low` and a larger
+/// budget; with the old 40 tokens they return an empty reply.
+fn groq_request_body(model: &str, system_prompt: &str, text: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": text}
+        ],
+        "max_tokens": 40,
+        "temperature": 0.1
+    });
+    if model.starts_with("openai/gpt-oss") {
+        body["reasoning_effort"] = serde_json::json!("low");
+        body["max_tokens"] = serde_json::json!(400);
+    }
+    body
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationDirection {
     pub from_code: String,
@@ -54,6 +104,7 @@ fn lang_name(code: &str) -> &str {
 #[derive(Clone)]
 pub struct TranslationEngine {
     groq_key: String,
+    groq_model: String,
     yandex_key: String,
     yandex_folder_id: String,
     litellm_base_url: String,
@@ -61,6 +112,8 @@ pub struct TranslationEngine {
     litellm_model: String,
     provider: String,
     client: reqwest::blocking::Client,
+    /// Used for Groq only; replaced by a fresh connection when Groq answers a transient 404.
+    groq_client: Arc<std::sync::Mutex<reqwest::blocking::Client>>,
     yandex: Arc<std::sync::OnceLock<yandex::YandexTranslator>>,
     litellm: Arc<std::sync::OnceLock<litellm::LiteLlmTranslator>>,
     #[cfg(feature = "local-mt")]
@@ -78,7 +131,12 @@ impl TranslationEngine {
                litellm_base_url: &str, litellm_api_key: &str, litellm_model: &str,
                #[cfg(feature = "local-mt")] mt_ruen_path: &str,
                #[cfg(feature = "local-mt")] mt_enru_path: &str) -> Result<Self> {
-        eprintln!("[TRANSLATION] Provider: '{}'", provider);
+        let groq_model = std::env::var("GROQ_MODEL")
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| DEFAULT_GROQ_MODEL.to_string());
+        eprintln!("[TRANSLATION] Provider: '{}', Groq model: '{}'", provider, groq_model);
         eprintln!("[TRANSLATION] Using GROQ_API_KEY: {}... (len={})",
             if groq_key.len() > 4 { &groq_key[..4] } else { "?" },
             groq_key.len());
@@ -90,14 +148,11 @@ impl TranslationEngine {
         #[cfg(feature = "local-mt")]
         eprintln!("[TRANSLATION] Local MT: ru->en='{}', en->ru='{}'",
             mt_ruen_path, mt_enru_path);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to build HTTP client")?;
+        let client = new_http_client()?;
+        let groq_client = Arc::new(std::sync::Mutex::new(new_http_client()?));
         Ok(Self {
             groq_key: groq_key.to_string(),
+            groq_model,
             yandex_key: yandex_key.to_string(),
             yandex_folder_id: yandex_folder_id.to_string(),
             litellm_base_url: litellm_base_url.to_string(),
@@ -105,6 +160,7 @@ impl TranslationEngine {
             litellm_model: litellm_model.to_string(),
             provider: provider.to_string(),
             client,
+            groq_client,
             yandex: Arc::new(std::sync::OnceLock::new()),
             litellm: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "local-mt")]
@@ -259,58 +315,33 @@ impl TranslationEngine {
     }
 
     fn translate_groq(&self, text: &str, direction: &TranslationDirection) -> Result<String> {
-        let system_prompt = format!(
-            "You are a machine translation API. \
-             Your ONLY output is the {to} translation of the user's {from} text. \
-             No explanations. No greetings. No disclaimers. \
-             Just the translation, word for word.\n\
-             Examples:\n\
-             User: привет как дела\n\
-             Assistant: hello how are you\n\
-             User: мне нужна помощь\n\
-             Assistant: i need help",
-            from = direction.from_name,
-            to = direction.to_name,
-        );
+        let system_prompt = groq_system_prompt(&direction.from_name, &direction.to_name);
 
-        let model = "llama-3.1-8b-instant";
-
-        let body = serde_json::json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": text}
-            ],
-            "max_tokens": 40,
-            "temperature": 0.1
-        });
-
+        let model = self.groq_model.as_str();
+        let body = groq_request_body(model, &system_prompt, text);
         let body_string = serde_json::to_string(&body).unwrap_or_default();
 
-        let debug_line = format!(
-            "🔑 KEY={}...{} (len={})\n📡 GROQ req: model={}, text={}",
-            &self.groq_key[..4.min(self.groq_key.len())],
-            &self.groq_key[32..36.min(self.groq_key.len())],
-            self.groq_key.len(),
-            model,
-            text,
-        );
+        // No key characters in the log: only the model and the text.
+        let debug_line = format!("📡 GROQ req: model={}, text={}", model, text);
         eprintln!("{}", debug_line);
         log_to_file("groq_debug.log", &debug_line);
 
         // Retry loop: 3 attempts with exponential backoff (1s, 2s, 4s)
         let max_attempts = 3;
         let mut last_error = None;
+        let mut last_was_transient_404 = false;
         for attempt in 1..=max_attempts {
             if attempt > 1 {
-                let delay_ms = 1000u64 * 2u64.pow(attempt as u32 - 2);
+                // A transient 404 needs a new connection, not a long wait.
+                let delay_ms = if last_was_transient_404 { 100 } else { 1000u64 * 2u64.pow(attempt as u32 - 2) };
                 let retry_msg = format!("🔁 GROQ retry #{}/{} after {}ms", attempt, max_attempts, delay_ms);
                 eprintln!("{}", retry_msg);
                 log_to_file("groq_debug.log", &retry_msg);
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             }
 
-            let response = self.client
+            let client = self.groq_client.lock().map(|c| c.clone()).unwrap_or_else(|_| self.client.clone());
+            let response = client
                 .post("https://api.groq.com/openai/v1/chat/completions")
                 .header("Authorization", format!("Bearer {}", self.groq_key))
                 .header("Content-Type", "application/json; charset=utf-8")
@@ -334,12 +365,14 @@ impl TranslationEngine {
                     };
 
                     let translated = groq_resp.choices.into_iter().next()
-                        .map(|c| c.message.content.trim().to_string())
-                        .unwrap_or_default()
-                        .replace("<think>", "")
-                        .replace("</think>", "");
+                        .and_then(|c| c.message.content)
+                        .map(|c| clean_groq_output(&c))
+                        .unwrap_or_default();
+                    if translated.trim().is_empty() {
+                        // A reasoning model that ran out of tokens answers with nothing.
+                        bail!("Groq returned an empty translation (model {})", model);
+                    }
 
-                    let translated = clean_groq_output(&translated);
 
                     let out_line = format!("✅ GROQ Output: {}", translated);
                     eprintln!("{}", out_line);
@@ -354,7 +387,13 @@ impl TranslationEngine {
                     let err_line = format!("❌ GROQ error {}: {}", status, body_text);
                     eprintln!("{}", err_line);
                     log_to_file("groq_debug.log", &err_line);
-                    if status.as_u16() >= 400 && status.as_u16() < 500 {
+                    last_was_transient_404 = is_transient_not_found(status.as_u16(), &body_text);
+                    if last_was_transient_404 {
+                        // Drop the pooled connection: the next attempt (and later calls) start fresh.
+                        if let (Ok(mut slot), Ok(fresh)) = (self.groq_client.lock(), new_http_client()) {
+                            *slot = fresh;
+                        }
+                    } else if status.as_u16() >= 400 && status.as_u16() < 500 {
                         bail!("Groq error {}: {}", status, body_text);
                     }
                     last_error = Some(anyhow::anyhow!("Groq error {}: {}", status, body_text));
@@ -390,53 +429,55 @@ impl TranslationEngine {
     }
 }
 
+/// Tidy a model reply without ever rewriting what was translated. (The old version guessed at
+/// "verbose" replies and cut real translations: anything containing "okay", "first," or a pair of
+/// quotation marks lost words.)
 fn clean_groq_output(text: &str) -> String {
-    let t = text.trim();
-    // Pattern: "something" translates to "translation"
-    if let Some(pos) = t.to_lowercase().find("translates to") {
-        let after = &t[pos + "translates to".len()..];
-        // Extract text between quotes
-        if let Some(start) = after.find('"') {
-            let rest = &after[start + 1..];
-            if let Some(end) = rest.find('"') {
-                return rest[..end].to_string();
-            }
+    let mut t = text.to_string();
+
+    // A reasoning model may leave a <think>...</think> block in the content.
+    while let (Some(open), Some(close)) = (t.find("<think>"), t.find("</think>")) {
+        if close < open {
+            break;
         }
-        // Or first sentence after "translates to"
-        let first_sentence = after.split(|c| c == '.' || c == '!' || c == '?')
-            .next().unwrap_or("").trim().trim_matches('"');
-        if !first_sentence.is_empty() {
-            return first_sentence.to_string();
+        t.replace_range(open..close + "</think>".len(), "");
+    }
+    let mut t = t.replace("<think>", "").replace("</think>", "");
+
+    // Replies are single-line text for the speech synthesiser.
+    t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // A leading label such as "Translation:" or "Перевод:".
+    for label in ["translation:", "перевод:", "translated:"] {
+        if t.to_lowercase().starts_with(label) {
+            t = t.chars().skip(label.chars().count()).collect::<String>().trim().to_string();
+            break;
         }
     }
-    // Pattern: starts with "Russian phrase" (quoted), extract the last quoted English
-    let parts: Vec<&str> = t.split('"').collect();
-    if parts.len() >= 3 {
-        // Try last quoted segment
-        if let Some(last) = parts.last() {
-            let candidate = last.trim();
-            if !candidate.is_empty() && candidate.len() < 100 {
-                return candidate.to_string();
+
+    // One pair of quotes around the whole reply is formatting, not part of the translation.
+    let pairs = [('"', '"'), ('\'', '\''), ('\u{ab}', '\u{bb}'), ('\u{201c}', '\u{201d}')];
+    for (open, close) in pairs {
+        if t.chars().count() >= 2 && t.starts_with(open) && t.ends_with(close) {
+            let inner: String = t.chars().skip(1).take(t.chars().count() - 2).collect();
+            if !inner.contains(open) && !inner.contains(close) {
+                t = inner.trim().to_string();
             }
+            break;
         }
     }
-    // If output contains verbose patterns, strip first sentence
-    let verbose_patterns = ["okay", "let's see", "the user said", "the user wrote",
-                            "translates to", "breaking it down", "first,", "i need to",
-                            "putting it together", "let me break"];
-    let lower = t.to_lowercase();
-    if verbose_patterns.iter().any(|p| lower.contains(p)) {
-        let sentences: Vec<&str> = t.split(|c| c == '.' || c == '!' || c == '?')
-            .map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        for s in sentences.iter().rev() {
-            let sl = s.to_lowercase();
-            if !verbose_patterns.iter().any(|p| sl.contains(p)) && !s.contains('"') {
-                return s.trim().to_string();
-            }
-        }
-        return sentences.last().unwrap_or(&"").trim().to_string();
-    }
-    t.to_string()
+
+    // Typographic characters that the speech synthesiser reads wrongly or skips.
+    t.chars()
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' => '\'',
+            '\u{2011}' | '\u{2010}' => '-',
+            '\u{a0}' | '\u{202f}' | '\u{2009}' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn log_to_file(filename: &str, line: &str) {
@@ -463,5 +504,81 @@ struct GroqChoice {
 
 #[derive(Deserialize)]
 struct GroqMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[cfg(test)]
+mod groq_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_models_get_effort_and_a_larger_budget() {
+        let body = groq_request_body("openai/gpt-oss-20b", "sys", "привет");
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["max_tokens"], 400);
+        assert_eq!(body["model"], "openai/gpt-oss-20b");
+        assert_eq!(body["messages"][1]["content"], "привет");
+    }
+
+    #[test]
+    fn other_models_keep_the_short_budget_and_no_reasoning_field() {
+        let body = groq_request_body("llama-3.1-8b-instant", "sys", "hi");
+        assert_eq!(body["max_tokens"], 40);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn null_or_missing_content_does_not_break_parsing() {
+        let null: GroqResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":null,"reasoning":"x"}}]}"#).unwrap();
+        assert!(null.choices[0].message.content.is_none());
+        let ok: GroqResponse = serde_json::from_str(r#"{"choices":[{"message":{"content":"hello"}}]}"#).unwrap();
+        assert_eq!(ok.choices[0].message.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_bare_not_found_is_transient_but_a_missing_model_is_not() {
+        assert!(is_transient_not_found(404, r#"{"error":{"message":"Not Found"}}"#));
+        assert!(!is_transient_not_found(
+            404,
+            r#"{"error":{"message":"The model `x` does not exist or you do not have access to it.","code":"model_not_found"}}"#
+        ));
+        assert!(!is_transient_not_found(401, r#"{"error":{"message":"Invalid API Key"}}"#));
+        assert!(!is_transient_not_found(400, r#"{"error":{"message":"Not Found"}}"#));
+    }
+
+    #[test]
+    fn prompt_names_both_languages_and_keeps_no_placeholders() {
+        let prompt = groq_system_prompt("Russian", "English");
+        assert!(prompt.contains("Russian to English"));
+        assert!(!prompt.contains("{from}") && !prompt.contains("{to}"));
+        assert!(!prompt.contains("word for word"), "the old prompt produced word-for-word grammar");
+    }
+
+    #[test]
+    fn real_translations_are_not_rewritten() {
+        // The old cleaner dropped "Okay." and cut text around quotation marks.
+        assert_eq!(clean_groq_output("Okay. Let's meet at three."), "Okay. Let's meet at three.");
+        assert_eq!(clean_groq_output("First, we need to check the numbers."), "First, we need to check the numbers.");
+        assert_eq!(clean_groq_output(r#"He said "yes" and left."#), r#"He said "yes" and left."#);
+        assert_eq!(clean_groq_output("Он сказал «да» и ушёл."), "Он сказал «да» и ушёл.");
+    }
+
+    #[test]
+    fn formatting_around_the_reply_is_removed() {
+        assert_eq!(clean_groq_output(r#""Good afternoon.""#), "Good afternoon.");
+        assert_eq!(clean_groq_output("«Добрый день.»"), "Добрый день.");
+        assert_eq!(clean_groq_output("Translation: Good afternoon."), "Good afternoon.");
+        assert_eq!(clean_groq_output("Перевод: Добрый день."), "Добрый день.");
+        assert_eq!(clean_groq_output("<think>hmm</think>Good afternoon."), "Good afternoon.");
+        assert_eq!(clean_groq_output("  Good\n afternoon.  "), "Good afternoon.");
+    }
+
+    #[test]
+    fn typography_the_voice_reads_wrongly_is_normalised() {
+        assert_eq!(clean_groq_output("Let\u{2019}s go"), "Let's go");
+        assert_eq!(clean_groq_output("бизнес\u{2011}приложения"), "бизнес-приложения");
+        assert_eq!(clean_groq_output("в\u{a0}три часа"), "в три часа");
+    }
 }

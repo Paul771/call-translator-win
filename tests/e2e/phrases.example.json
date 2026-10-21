@@ -1,0 +1,19 @@
+{
+  "languages": { "my": "ru", "their": "en" },
+  "phrases": [
+    {
+      "id": "ru-01",
+      "direction": "outgoing",
+      "audio": "fixtures/user/ru-01.m4a",
+      "text": "Добрый день, меня зовут Павел, рад познакомиться.",
+      "expected": "Good afternoon, my name is Pavel, nice to meet you."
+    },
+    {
+      "id": "en-01",
+      "direction": "incoming",
+      "audio": "fixtures/user/en-01.m4a",
+      "text": "Hello, can you hear me clearly?",
+      "expected": "Здравствуйте, вы хорошо меня слышите?"
+    }
+  ]
+}

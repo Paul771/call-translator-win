@@ -26,6 +26,14 @@ pub enum Command {
         lang: String,
         voice: String,
     },
+    /// Test harness only: feed a 16 kHz WAV into a pipeline whose capture
+    /// device is `inject`. `tail_ms` is the silence appended after the speech.
+    InjectAudio {
+        pipeline: String,
+        path: String,
+        #[serde(default)]
+        tail_ms: Option<u32>,
+    },
 }
 
 /// Events sent from Rust to Elixir.

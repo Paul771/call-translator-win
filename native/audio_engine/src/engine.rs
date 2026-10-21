@@ -4,7 +4,7 @@
 //!   OUTGOING: Mic -> Deepgram(ru) -> Translate(ru->en) -> TTS(en) -> Speakers
 //!   INCOMING: BlackHole 16ch -> Deepgram(en) -> Translate(en->ru) -> TTS(ru) -> Speakers
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -222,6 +222,19 @@ impl Engine {
                     level: "info".into(),
                     message: format!("Config set: {} = {}", key, value),
                 }]
+            }
+
+            Command::InjectAudio { pipeline, path, tail_ms } => {
+                let tail = tail_ms.unwrap_or(audio::inject::DEFAULT_TAIL_MS);
+                match audio::inject::inject_wav(&pipeline, &path, tail, self.event_tx.clone()) {
+                    Ok(seconds) => vec![Event::Log {
+                        level: "info".into(),
+                        message: format!("inject_started {} {:.2}s", pipeline, seconds),
+                    }],
+                    Err(e) => vec![Event::Error {
+                        message: format!("inject_audio failed: {:#}", e),
+                    }],
+                }
             }
 
             Command::ListDevices => match audio::list_devices() {
@@ -598,6 +611,12 @@ fn run_pipeline(
                 info!("[loopback-bridge] std::mpsc channel closed, bridge exiting");
             })
             .context("Failed to spawn loopback bridge thread")?;
+    } else if capture_device == audio::inject::INJECT_DEVICE {
+        // Test mode: audio is pushed in through the `inject_audio` command.
+        info!("[{}] Using virtual 'inject' capture (test mode)", direction);
+        tracelog::trace(direction, "DEVICE", "virtual inject capture (test mode)");
+        capture_rate = audio::inject::INJECT_RATE;
+        audio::inject::register(direction, audio_tx);
     } else {
         // Small delay to allow previous WASAPI sessions to fully release
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -610,7 +629,7 @@ fn run_pipeline(
         _capture_handle = Some(capture);
     }
 
-    let playback = AudioPlayback::new(playback_device, sample_rate, playback_rx)
+    let playback = audio::inject::Playback::open(playback_device, sample_rate, playback_rx)
         .with_context(|| format!("[{}] Failed to create AudioPlayback", direction))?;
 
     // Use the playback device's NATIVE rate for TTS — this matches what the hardware uses
@@ -766,12 +785,55 @@ fn run_pipeline(
 
     let mut tts: Option<TtsEngine> = None;
     let mut segmenter = crate::pipeline::segmenter::TextSegmenter::new();
+    // TRANSLATOR_MIN_SEGMENT_WORDS=1 turns the merging of short fragments off.
+    let min_segment_words = std::env::var("TRANSLATOR_MIN_SEGMENT_WORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(crate::pipeline::segmenter::MIN_SEGMENT_WORDS);
+    let mut joiner = crate::pipeline::segmenter::FragmentJoiner::new(
+        min_segment_words,
+        crate::pipeline::segmenter::QUIET_BEFORE_RELEASE,
+        crate::pipeline::segmenter::MAX_HOLD,
+    );
+    // Milliseconds (+1) since `activity_base` of the last recogniser result of any kind;
+    // 0 = none yet. Lets the processor tell "speaker paused" from "speaker still talking".
+    let activity_base = Instant::now();
+    let activity = Arc::new(AtomicU64::new(0));
+    let proc_activity = activity.clone();
     let job_queue = crate::pipeline::job_queue::JobQueue::new();
     let mut utterance_start: Option<Instant> = None;
 
     let _proc_echo = set_other_suppress.clone();
     let _proc_handle = std::thread::spawn(move || {
-        while let Ok((text, stt_ms, stt_kind)) = proc_rx.recv() {
+        loop {
+            // Wait for the next transcript. A held short fragment is released alone
+            // when its wait runs out (`next` is None then).
+            let last_activity = match proc_activity.load(Ordering::Relaxed) {
+                0 => None,
+                ms => Some(activity_base + Duration::from_millis(ms - 1)),
+            };
+            let next = match joiner.remaining(Instant::now(), last_activity) {
+                Some(wait) => match proc_rx.recv_timeout(wait) {
+                    Ok(msg) => Some(msg),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // More speech may have arrived meanwhile: re-check the deadline first.
+                        let recent = match proc_activity.load(Ordering::Relaxed) {
+                            0 => None,
+                            ms => Some(activity_base + Duration::from_millis(ms - 1)),
+                        };
+                        match joiner.remaining(Instant::now(), recent) {
+                            Some(left) if !left.is_zero() => continue,
+                            _ => None,
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                },
+                None => match proc_rx.recv() {
+                    Ok(msg) => Some(msg),
+                    Err(_) => break,
+                },
+            };
+
             // Check if TTS has finished loading (non-blocking).
             if let Ok(Some(engine)) = tts_ready_rx.try_recv() {
                 tracelog::trace(&proc_direction, "TTS", "TTS engine ready, switching to full pipeline ✓");
@@ -781,29 +843,52 @@ fn run_pipeline(
                 tts = None;
             }
 
-            // A final transcript marks the end of an utterance: reset the
-            // segmenter so the next utterance starts with a clean slate,
-            // even if it shares a prefix with the previous one.
-            let is_final = stt_kind == crate::stt::SttResultKind::Final;
+            let (text_to_process, stt_ms, is_final) = match next {
+                Some((text, stt_ms, stt_kind)) => {
+                    // A final transcript marks the end of an utterance: reset the
+                    // segmenter so the next utterance starts with a clean slate,
+                    // even if it shares a prefix with the previous one.
+                    let is_final = stt_kind == crate::stt::SttResultKind::Final;
 
-            // Segmenter: extract only the incremental delta from stable partials
-            // to avoid retranslating the same prefix. Finals reset the segmenter.
-            let text_to_process = if let Some(delta) = segmenter.next_segment(&text) {
-                tracelog::trace(&proc_direction, "SEGMENT", &format!("delta '{}' (full: '{}')", delta, text));
-                delta
-            } else {
-                tracelog::trace(&proc_direction, "SEGMENT", &format!("no new segment in '{}'", text));
-                // Still emit the transcript event for the UI, but skip translation
-                let _ = proc_event_tx.try_send(Event::Transcript {
-                    direction: proc_direction.clone(),
-                    text: text.clone(),
-                    lang: proc_source_lang.clone(),
-                    stt_ms,
-                });
-                if is_final {
-                    segmenter.reset();
+                    // Segmenter: extract only the incremental delta from stable partials
+                    // to avoid retranslating the same prefix. Finals reset the segmenter.
+                    let segment = segmenter.next_segment(&text);
+                    if let Some(delta) = &segment {
+                        tracelog::trace(&proc_direction, "SEGMENT", &format!("delta '{}' (full: '{}')", delta, text));
+                    }
+
+                    // Very short fragments (one word) are merged into the next one:
+                    // spoken alone they are a clipped blip and lose their context.
+                    match joiner.offer(segment, Instant::now()) {
+                        crate::pipeline::segmenter::Joined::Ready(t) => (t, stt_ms, is_final),
+                        other => {
+                            let held = other == crate::pipeline::segmenter::Joined::Held;
+                            tracelog::trace(&proc_direction, "SEGMENT", &if held {
+                                format!("holding short fragment from '{}'", text)
+                            } else {
+                                format!("no new segment in '{}'", text)
+                            });
+                            // Still emit the transcript event for the UI, but skip translation
+                            let _ = proc_event_tx.try_send(Event::Transcript {
+                                direction: proc_direction.clone(),
+                                text: text.clone(),
+                                lang: proc_source_lang.clone(),
+                                stt_ms,
+                            });
+                            if is_final {
+                                segmenter.reset();
+                            }
+                            continue;
+                        }
+                    }
                 }
-                continue;
+                None => match joiner.flush() {
+                    Some(text) => {
+                        tracelog::trace(&proc_direction, "SEGMENT", &format!("releasing held fragment '{}'", text));
+                        (text, 0, false)
+                    }
+                    None => continue,
+                },
             };
 
             let job_id = job_queue.next_job();
@@ -871,7 +956,13 @@ fn run_pipeline(
     let mut need_reconnect = false;
     let mut reconnect_attempts: u32 = 0;
     let mut deepgram_drop_count: u32 = 0;
+    // Time the current STT session was established. A drop after a session that
+    // stayed up for STABLE_SESSION_SECS starts a new incident; shorter sessions
+    // keep accumulating toward MAX_DEEPGRAM_DROPS.
+    let mut session_started = Instant::now();
+    const VOICE_RAW_RMS: f32 = 0.01;
     const MAX_DEEPGRAM_DROPS: u32 = 3;
+    const STABLE_SESSION_SECS: u64 = 60;
     const MAX_BACKOFF_MS: u64 = 30000;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
@@ -883,6 +974,10 @@ fn run_pipeline(
         }
 
         if need_reconnect {
+            if session_started.elapsed() >= Duration::from_secs(STABLE_SESSION_SECS) {
+                // This drop follows a healthy session: it is the first of a new incident.
+                deepgram_drop_count = 1;
+            }
             reconnect_attempts += 1;
             let backoff_ms = std::cmp::min(
                 2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
@@ -903,6 +998,7 @@ fn run_pipeline(
                             session = UnifiedSttSession::Yandex(ys);
                             need_reconnect = false;
                             reconnect_attempts = 0;
+                            session_started = Instant::now();
                             info!("[{}] Switched to Yandex STT ✓", direction);
                             continue;
                         }
@@ -913,6 +1009,7 @@ fn run_pipeline(
                             session = UnifiedSttSession::Whisper(ws);
                             need_reconnect = false;
                             reconnect_attempts = 0;
+                            session_started = Instant::now();
                             info!("[{}] Switched to local Whisper STT ✓", direction);
                             continue;
                         }
@@ -923,15 +1020,15 @@ fn run_pipeline(
                     }
                 }
 
-                // Stay on Deepgram: try reconnecting to Deepgram.
-                // On success the drop counter resets, so transient network blips
-                // don't permanently push us to a fallback provider.
+                // Stay on Deepgram: try reconnecting to Deepgram. The drop counter is
+                // not reset here; it resets only after a stable session (see above),
+                // so the ~20 s drop pattern still reaches the fallback threshold.
                 match stt.create_session(stt_sample_rate) {
                     Ok(new_session) => {
                         session = UnifiedSttSession::Deepgram(new_session);
                         need_reconnect = false;
                         reconnect_attempts = 0;
-                        deepgram_drop_count = 0;
+                        session_started = Instant::now();
                         info!("[{}] Deepgram reconnected (drop_count={})", direction, deepgram_drop_count);
                     }
                     Err(e) => {
@@ -948,6 +1045,7 @@ fn run_pipeline(
                             session = UnifiedSttSession::Whisper(ws);
                             need_reconnect = false;
                             reconnect_attempts = 0;
+                            session_started = Instant::now();
                             info!("[{}] Switched to local Whisper STT ✓", direction);
                             continue;
                         }
@@ -966,7 +1064,7 @@ fn run_pipeline(
                         session = UnifiedSttSession::Yandex(ys);
                         need_reconnect = false;
                         reconnect_attempts = 0;
-                        deepgram_drop_count = 0;
+                        session_started = Instant::now();
                         info!("[{}] Yandex reconnected ✓", direction);
                         continue;
                     }
@@ -983,6 +1081,7 @@ fn run_pipeline(
                         session = UnifiedSttSession::Whisper(ws);
                         need_reconnect = false;
                         reconnect_attempts = 0;
+                        session_started = Instant::now();
                         info!("[{}] Whisper restarted ✓", direction);
                         continue;
                     }
@@ -1000,6 +1099,17 @@ fn run_pipeline(
         for chunk in audio_rx.try_iter().take(10) {
             if mute_flag.load(Ordering::Relaxed) {
                 continue;
+            }
+            // Echo gate: the other pipeline's TTS is playing and may be picked up
+            // by this capture device, so its audio must not reach STT.
+            if my_suppress.load(Ordering::SeqCst) {
+                continue;
+            }
+            // Speech heard right now postpones the release of a held short fragment:
+            // the recogniser only reports the continuation about a second later.
+            // raw_rms is measured before the capture gain, so room noise stays below it.
+            if chunk.raw_rms > VOICE_RAW_RMS {
+                activity.store(activity_base.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
             }
             let samples_16k = resample(&chunk.samples, capture_rate, stt_sample_rate);
             let rms = (samples_16k.iter().map(|s| s * s).sum::<f32>() / samples_16k.len().max(1) as f32).sqrt();
@@ -1052,6 +1162,7 @@ fn run_pipeline(
         // Non-blocking poll — returns immediately on WouldBlock
         match session.poll_transcript() {
             Ok(Some(result)) => {
+                activity.store(activity_base.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
                 match result.kind {
                     crate::stt::SttResultKind::Partial => {
                         tracelog::trace(direction, "STT", &format!("PARTIAL text='{}'", result.text));
@@ -1105,6 +1216,7 @@ fn run_pipeline(
     }
 
     session.close();
+    audio::inject::unregister(direction);
     let _ = playback.stop();
     drop(playback_tx);
 
