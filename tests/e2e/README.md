@@ -118,3 +118,17 @@ python tests/e2e/probe_stt.py --phrases tests/e2e/phrases.json --only ru-02 \
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 cargo build --release --bin audio_engine
 ```
+
+## Оценка промпта Groq
+
+`tests/e2e/prompt_eval.py` прогоняет 28 фраз (RU→EN и EN→RU, с эталонами) через кандидатов
+промпта и выводит среднюю оценку судьи, долю оценок ≥ 4 и задержку. Кандидат `file` берёт
+текст из `native/audio_engine/src/translation/groq_prompt.txt`, тот же файл, что и движок:
+
+```bash
+python tests/e2e/prompt_eval.py --candidates file yandex --repeat 2 --show --out tests/e2e/results/prompt.json
+```
+
+Запросы идут последовательно с паузой, потому что Groq отвечает 429 при параллельной нагрузке.
+Колонка `unjudged` показывает ответы без оценки судьи: средние по ним не считаются.
+

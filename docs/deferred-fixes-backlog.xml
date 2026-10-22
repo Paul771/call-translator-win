@@ -88,4 +88,16 @@
       or a per-utterance concurrency budget; measure quota impact first.
     </fix-direction>
   </Fix>
+  <Fix id="DF-8" PRIORITY="medium" STATUS="pending">
+    <title>Windows paths are hardcoded in the Elixir orchestrator</title>
+    <file>lib/translator/audio_engine.ex</file>
+    <problem>
+      `base_dir` and `ORT_DYLIB_PATH` are fixed to `C:/Users/Pavel/AppData/Roaming/npm/call-translator-win`
+      (lines around 250, 277 and 326). Any other user gets a wrong engine or onnxruntime path.
+    </problem>
+    <fix-direction>
+      Derive the base directory from the install location (or an env var) and the onnxruntime path
+      from `ORT_DYLIB_PATH` in `.env`, with no per-user default.
+    </fix-direction>
+  </Fix>
 </DeferredFixes>

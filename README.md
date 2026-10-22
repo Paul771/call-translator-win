@@ -98,7 +98,7 @@ Open **http://127.0.0.1:5050** in **Google Chrome**. Settings open automatically
 
 **API Keys (free tiers available):**
 - [Deepgram](https://console.deepgram.com) — speech-to-text (Nova-3 model)
-- [Groq](https://console.groq.com) — translation via llama-3.3-70b
+- [Groq](https://console.groq.com) — translation via `openai/gpt-oss-20b` (set `GROQ_MODEL` to change)
 
 ---
 
