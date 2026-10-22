@@ -25,6 +25,7 @@
   instead of waiting 8 s for a timeout. The worker also uses the sample rate sent by Rust in the WAV header.
 - Local MT returns an error instead of panicking when its model path is empty or the model fails to load.
 - Windows paths are derived from `%APPDATA%` instead of a fixed user directory.
+- Auto translation mode asks Groq first and calls LiteLLM and Yandex only when Groq fails or stays silent for 6 s (previously all three ran on every utterance).
 - Removed `JobQueue`: stale-job checks could never fire because jobs run one at a time, so nothing was cancelled.
 
 ### Added

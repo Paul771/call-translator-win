@@ -75,7 +75,7 @@
     </fix-direction>
   </Fix>
 
-  <Fix id="DF-7" PRIORITY="low" STATUS="pending">
+  <Fix id="DF-7" PRIORITY="low" STATUS="done">
     <title>Hedge translation burns quota x3 in auto mode</title>
     <file>native/audio_engine/src/translation/mod.rs</file>
     <problem>
