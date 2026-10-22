@@ -800,7 +800,6 @@ fn run_pipeline(
     let activity_base = Instant::now();
     let activity = Arc::new(AtomicU64::new(0));
     let proc_activity = activity.clone();
-    let job_queue = crate::pipeline::job_queue::JobQueue::new();
     let mut utterance_start: Option<Instant> = None;
 
     let _proc_echo = set_other_suppress.clone();
@@ -891,8 +890,7 @@ fn run_pipeline(
                 },
             };
 
-            let job_id = job_queue.next_job();
-            tracelog::trace(&proc_direction, "PROCESSOR", &format!("JOB #{} text='{}' stt={}ms", job_id, text_to_process, stt_ms));
+            tracelog::trace(&proc_direction, "PROCESSOR", &format!("JOB text='{}' stt={}ms", text_to_process, stt_ms));
 
             // Track utterance start for time-to-first-audio metric
             if utterance_start.is_none() {
@@ -929,13 +927,6 @@ fn run_pipeline(
                         message: format!("[{}] first_audio={}ms", proc_direction, first_audio_ms),
                     });
                 }
-            }
-
-            // If this job is stale (newer job already completed), log the drop
-            if job_queue.is_stale(job_id) && _audio_len > 0 {
-                tracelog::trace(&proc_direction, "PROCESSOR", &format!("stale job #{} dropped (newer job already committed)", job_id));
-            } else {
-                job_queue.try_commit(job_id);
             }
 
             // Echo suppression: only outgoing suppresses incoming (TTS goes to CABLE, not Jabra)

@@ -247,7 +247,7 @@ defp open_port do
     engine_path = Application.get_env(:translator, :audio_engine_path)
     settings = read_settings()
     # Use absolute path - project is at call-translator-win
-    base_dir = "C:/Users/Pavel/AppData/Roaming/npm/call-translator-win"
+    base_dir = app_base_dir()
     models_base = Path.join(base_dir, "models")
     Logger.info("Using models base: #{models_base}")
 
@@ -266,6 +266,25 @@ defp open_port do
     out_voice = if out_voice == "", do: default_voice(models_base, their_lang), else: out_voice
     in_voice = if in_voice == "", do: default_voice(models_base, my_lang), else: in_voice
 
+    # Local-first preset: whisper STT, local MT and short endpointing. It needs both local
+    # MT model paths; without them it is ignored and the user's providers are kept.
+    local_first_requested? = Map.get(settings, "local_first") == true
+
+    local_mt_ready? =
+      Map.get(settings, "local_mt_ruen_path", "") != "" and
+        Map.get(settings, "local_mt_enru_path", "") != ""
+
+    local_first? = local_first_requested? && local_mt_ready?
+
+    if local_first_requested? and not local_mt_ready? do
+      Logger.error("local_first ignored: local_mt_ruen_path and local_mt_enru_path must both be set")
+    end
+
+    stt_provider = if local_first?, do: "whisper", else: Map.get(settings, "stt_provider", "auto")
+    translation_provider = if local_first?, do: "local_mt", else: Map.get(settings, "translation_provider", "auto")
+    endpointing_ms = if local_first?, do: 150, else: Map.get(settings, "endpointing_ms", 300)
+    utterance_end_ms = if local_first?, do: 400, else: Map.get(settings, "utterance_end_ms", 500)
+
     if engine_path && File.exists?(engine_path) do
       port =
         Port.open({:spawn_executable, engine_path}, [
@@ -274,7 +293,7 @@ defp open_port do
           :exit_status,
           {:env, [
             {~c"RUST_LOG", ~c"info"},
-            {~c"ORT_DYLIB_PATH", ~c"C:/Users/Pavel/AppData/Roaming/npm/call-translator-win/onnxruntime.dll"},
+            {~c"ORT_DYLIB_PATH", String.to_charlist(Path.join(app_base_dir(), "onnxruntime.dll"))},
             {~c"DEEPGRAM_API_KEY", charlist_setting(settings, "deepgram_api_key", "DEEPGRAM_API_KEY")},
             {~c"GROQ_API_KEY", charlist_setting(settings, "groq_api_key", "GROQ_API_KEY")},
             {~c"YANDEX_API_KEY", charlist_setting(settings, "yandex_api_key", "YANDEX_API_KEY")},
@@ -287,13 +306,6 @@ defp open_port do
             {~c"TRANSLATOR_SPEAKER_DEVICE", String.to_charlist(Map.get(settings, "speaker_device", "default"))},
             {~c"TRANSLATOR_MEET_INPUT", String.to_charlist(Map.get(settings, "meet_input_device", "CABLE Output (VB-Audio Virtual Cable)"))},
             {~c"TRANSLATOR_MEET_OUTPUT", String.to_charlist(Map.get(settings, "meet_output_device", "CABLE Input (VB-Audio Virtual Cable)"))},
-
-            # Apply local-first preset override before building env vars.
-            local_first? = Map.get(settings, "local_first", false)
-            stt_provider = if local_first?, do: "whisper", else: Map.get(settings, "stt_provider", "auto")
-            translation_provider = if local_first?, do: "local_mt", else: Map.get(settings, "translation_provider", "auto")
-            endpointing_ms = if local_first?, do: 150, else: Map.get(settings, "endpointing_ms", 300)
-            utterance_end_ms = if local_first?, do: 400, else: Map.get(settings, "utterance_end_ms", 500)
 
             {~c"TRANSLATOR_ENDPOINTING_MS", String.to_charlist("#{endpointing_ms}")},
             {~c"TRANSLATOR_UTTERANCE_END_MS", String.to_charlist("#{utterance_end_ms}")},
@@ -322,8 +334,13 @@ defp open_port do
     end
   end
 
+  # Install directory of the npm-installed app, under %APPDATA%.
+  defp app_base_dir do
+    Path.join([System.get_env("APPDATA", ""), "npm", "call-translator-win"])
+  end
+
   defp read_settings do
-    base_dir = "C:/Users/Pavel/AppData/Roaming/npm/call-translator-win"
+    base_dir = app_base_dir()
     settings_path = Path.join(base_dir, "settings.json")
 
     case File.read(settings_path) do

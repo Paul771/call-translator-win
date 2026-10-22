@@ -23,7 +23,7 @@ def write_msg(obj):
     sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
 
-def transcribe_audio_b64(b64_str):
+def transcribe_audio_b64(b64_str, sample_rate):
     import tempfile, os
     pcm = base64.b64decode(b64_str)
     # Write PCM to a temp WAV in-memory via file (faster-whisper needs a file path)
@@ -34,7 +34,7 @@ def transcribe_audio_b64(b64_str):
         header = struct.pack(
             "<4sI4s4sIHHIIHH4sI",
             b"RIFF", 36 + len(pcm),
-            b"WAVE", b"fmt ", 16, 1, 1, 16000, 16000 * 2, 2, 16,
+            b"WAVE", b"fmt ", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
             b"data", len(pcm)
         )
         with open(wav_path, "wb") as f:
@@ -61,7 +61,11 @@ while True:
     cmd = msg.get("cmd")
     if cmd == "init":
         model_size = msg.get("model", "tiny")
-        MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+        try:
+            MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+        except Exception as e:
+            write_msg({"error": f"model init failed: {e}"})
+            continue
         write_msg({"status": "ok"})
     elif cmd == "transcribe":
         if MODEL is None:
@@ -71,7 +75,12 @@ while True:
         if not audio_b64:
             write_msg({"text": "", "language": "??", "duration": 0})
             continue
-        result = transcribe_audio_b64(audio_b64)
+        # Report failures as a structured reply so Rust fails fast instead of waiting for its timeout.
+        try:
+            result = transcribe_audio_b64(audio_b64, int(msg.get("sample_rate", 16000)))
+        except Exception as e:
+            write_msg({"error": f"transcribe failed: {e}"})
+            continue
         write_msg(result)
     else:
         write_msg({"error": f"unknown command: {cmd}"})

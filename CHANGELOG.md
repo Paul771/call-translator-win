@@ -18,6 +18,14 @@
 - Deepgram `utterance_end_ms` is clamped to at least 1000 (Deepgram rejects smaller values with HTTP 400).
 - Echo suppression gate and the Deepgram drop counter in `engine.rs`.
 - Yandex translation no longer panics on Cyrillic text (char-safe preview).
+- `lib/translator/audio_engine.ex` did not parse: the `local_first` block sat inside the engine's
+  environment list. The preset is now computed before the port opens, and it applies only when both
+  local MT model paths are set (otherwise it is ignored and logged).
+- Whisper worker reports exceptions as `{"error": ...}`; the engine recreates the session at once
+  instead of waiting 8 s for a timeout. The worker also uses the sample rate sent by Rust in the WAV header.
+- Local MT returns an error instead of panicking when its model path is empty or the model fails to load.
+- Windows paths are derived from `%APPDATA%` instead of a fixed user directory.
+- Removed `JobQueue`: stale-job checks could never fire because jobs run one at a time, so nothing was cancelled.
 
 ### Added
 

@@ -277,26 +277,28 @@ impl TranslationEngine {
 
     #[cfg(feature = "local-mt")]
     fn translate_local_mt(&self, text: &str, direction: &TranslationDirection) -> Result<(String, String)> {
-        let model = if direction.from_code == "ru" && direction.to_code == "en" {
-            &self.mt_ruen
+        let (cell, path) = if direction.from_code == "ru" && direction.to_code == "en" {
+            (&self.mt_ruen, &self.mt_ruen_path)
         } else if direction.from_code == "en" && direction.to_code == "ru" {
-            &self.mt_enru
+            (&self.mt_enru, &self.mt_enru_path)
         } else {
-            anyhow::bail!("Local MT not available for {}→{}", direction.from_code, direction.to_code);
+            bail!("Local MT not available for {}→{}", direction.from_code, direction.to_code);
         };
 
-        let mt = model.get_or_init(|| {
-            let path = if direction.from_code == "ru" {
-                &self.mt_ruen_path
-            } else {
-                &self.mt_enru_path
-            };
-            if path.is_empty() {
-                panic!("Local MT model path not configured");
+        // An unconfigured or broken model is an ordinary translation error, not a panic
+        // in the worker thread.
+        let mt = match cell.get() {
+            Some(loaded) => loaded,
+            None => {
+                if path.is_empty() {
+                    bail!("Local MT model path not configured for {}→{}", direction.from_code, direction.to_code);
+                }
+                let loaded = model::TranslationModel::new(std::path::Path::new(path))
+                    .with_context(|| format!("Failed to load local MT model from {}", path))?;
+                let _ = cell.set(loaded);
+                cell.get().context("Local MT model was not stored")?
             }
-            model::TranslationModel::new(std::path::Path::new(path))
-                .expect("Failed to load local MT model")
-        });
+        };
 
         let result = mt.translate(text)?;
         eprintln!("[LOCAL_MT] {}→{}: '{}' → '{}'", direction.from_code, direction.to_code, text, result);

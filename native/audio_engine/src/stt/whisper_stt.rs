@@ -107,7 +107,8 @@ impl WhisperSttSession {
 
         let msg = serde_json::json!({
             "cmd": "transcribe",
-            "audio_b64": base64_enc(&pcm)
+            "audio_b64": base64_enc(&pcm),
+            "sample_rate": self.sample_rate
         });
         write_msg(stdin, &msg)?;
 
@@ -125,6 +126,13 @@ impl WhisperSttSession {
             Ok((Ok(resp), rdr)) => {
                 self.reader = Some(rdr);
                 let latency_ms = start.elapsed().as_millis() as u64;
+
+                // The worker caught an exception and is still alive: report it and let the
+                // engine recreate the session now, rather than waiting for the 8 s timeout.
+                if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+                    self.close();
+                    anyhow::bail!("Whisper worker error: {}", err);
+                }
 
                 let text = resp.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let lang = resp.get("language").and_then(|v| v.as_str()).unwrap_or("??").to_string();
