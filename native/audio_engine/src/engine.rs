@@ -947,6 +947,8 @@ fn run_pipeline(
     let mut need_reconnect = false;
     let mut reconnect_attempts: u32 = 0;
     let mut deepgram_drop_count: u32 = 0;
+    // Last interim text of the utterance in flight; handed to the processor if STT drops.
+    let mut last_interim = String::new();
     // Time the current STT session was established. A drop after a session that
     // stayed up for STABLE_SESSION_SECS starts a new incident; shorter sessions
     // keep accumulating toward MAX_DEEPGRAM_DROPS.
@@ -955,6 +957,7 @@ fn run_pipeline(
     const MAX_DEEPGRAM_DROPS: u32 = 3;
     const STABLE_SESSION_SECS: u64 = 60;
     const MAX_BACKOFF_MS: u64 = 30000;
+    const FIRST_RECONNECT_MS: u64 = 300;
     let mut loop_count: u64 = 0;
     let diag_interval = 100u64;
     let mut last_audio_sent = Instant::now();
@@ -970,10 +973,15 @@ fn run_pipeline(
                 deepgram_drop_count = 1;
             }
             reconnect_attempts += 1;
-            let backoff_ms = std::cmp::min(
-                2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts.saturating_sub(1), 16)),
-                MAX_BACKOFF_MS,
-            );
+            // The first retry is quick (a reset connection is usually a one-off); later ones back off.
+            let backoff_ms = if reconnect_attempts <= 1 {
+                FIRST_RECONNECT_MS
+            } else {
+                std::cmp::min(
+                    2000u64 * 2u64.pow(std::cmp::min(reconnect_attempts - 2, 16)),
+                    MAX_BACKOFF_MS,
+                )
+            };
             info!("[{}] Reconnecting STT (attempt #{}, {}ms backoff, drop_count={})...", direction, reconnect_attempts, backoff_ms, deepgram_drop_count);
             session.close();
             std::thread::sleep(Duration::from_millis(backoff_ms));
@@ -1111,6 +1119,7 @@ fn run_pipeline(
             if let Err(e) = session.send_audio(&samples_16k) {
                 warn!("[{}] STT send error: {:#}", direction, e);
                 tracelog::trace(direction, "ERROR", &format!("STT send FAILED: {}", e));
+                release_interim(&mut last_interim, &proc_tx, direction);
                 deepgram_drop_count += 1;
                 need_reconnect = true;
                 break;
@@ -1131,6 +1140,7 @@ fn run_pipeline(
                 let silence: Vec<f32> = vec![0.0; silence_samples];
                 if let Err(e) = session.send_audio(&silence) {
                     warn!("[{}] STT keepalive send error: {:#}", direction, e);
+                    release_interim(&mut last_interim, &proc_tx, direction);
                     deepgram_drop_count += 1;
                     need_reconnect = true;
                 }
@@ -1157,6 +1167,7 @@ fn run_pipeline(
                 match result.kind {
                     crate::stt::SttResultKind::Partial => {
                         tracelog::trace(direction, "STT", &format!("PARTIAL text='{}'", result.text));
+                        last_interim = result.text.clone();
                         let _ = event_tx.try_send(Event::PartialTranscript {
                             direction: direction.to_string(),
                             text: result.text,
@@ -1166,6 +1177,7 @@ fn run_pipeline(
                     }
                     crate::stt::SttResultKind::StablePartial => {
                         tracelog::trace(direction, "STT", &format!("STABLE_PARTIAL stt={}ms text='{}'", result.stt_latency_ms, result.text));
+                        last_interim = result.text.clone();
                         let _ = event_tx.try_send(Event::StablePartialTranscript {
                             direction: direction.to_string(),
                             text: result.text.clone(),
@@ -1179,6 +1191,7 @@ fn run_pipeline(
                     }
                     crate::stt::SttResultKind::Final => {
                         tracelog::trace(direction, "STT", &format!("FINAL stt={}ms text='{}'", result.stt_latency_ms, result.text));
+                        last_interim.clear();
                         if let Err(e) = proc_tx.try_send((result.text.clone(), result.stt_latency_ms, result.kind)) {
                             warn!("[{}] Processor channel full, dropping transcript: {}", direction, e);
                         } else {
@@ -1194,6 +1207,7 @@ fn run_pipeline(
                 let _ = event_tx.try_send(Event::Error {
                     message: format!("[{}] STT error: {:#}", direction, e),
                 });
+                release_interim(&mut last_interim, &proc_tx, direction);
                 deepgram_drop_count += 1;
                 need_reconnect = true;
             }
@@ -1213,6 +1227,23 @@ fn run_pipeline(
 
     info!("[{}] Pipeline stopped cleanly", direction);
     Ok(())
+}
+
+/// A dropped STT connection loses the utterance in flight. Hand its last interim text to the
+/// processor as a final result so the speaker is still heard instead of silently skipped.
+fn release_interim(
+    last_interim: &mut String,
+    proc_tx: &Sender<(String, u64, crate::stt::SttResultKind)>,
+    direction: &str,
+) {
+    let text = std::mem::take(last_interim);
+    if text.trim().is_empty() {
+        return;
+    }
+    tracelog::trace(direction, "STT", &format!("connection lost mid-utterance, releasing last interim '{}'", text));
+    if let Err(e) = proc_tx.try_send((text, 0, crate::stt::SttResultKind::Final)) {
+        warn!("[{}] Processor channel full, dropping interim: {}", direction, e);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,4 +1459,31 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod interim_tests {
+    use super::*;
+    use crate::stt::SttResultKind;
+
+    #[test]
+    fn dropped_connection_releases_the_last_interim_once() {
+        let (tx, rx) = bounded::<(String, u64, SttResultKind)>(4);
+        let mut interim = "мы отправили вам коммерческое предложение".to_string();
+        release_interim(&mut interim, &tx, "outgoing");
+        let (text, _, kind) = rx.try_recv().expect("interim must reach the processor");
+        assert_eq!(text, "мы отправили вам коммерческое предложение");
+        assert!(matches!(kind, SttResultKind::Final));
+        assert!(interim.is_empty());
+        release_interim(&mut interim, &tx, "outgoing");
+        assert!(rx.try_recv().is_err(), "nothing is released twice");
+    }
+
+    #[test]
+    fn blank_interim_is_not_released() {
+        let (tx, rx) = bounded::<(String, u64, SttResultKind)>(4);
+        let mut interim = "   ".to_string();
+        release_interim(&mut interim, &tx, "incoming");
+        assert!(rx.try_recv().is_err());
+    }
 }
