@@ -23,13 +23,23 @@ pub struct WhisperSttSession {
 
 const BUFFER_SECS: f32 = 2.0;
 
+/// Interpreter that runs `whisper_worker.py`: `TRANSLATOR_PYTHON` if set, otherwise
+/// `pythonw.exe` (no console window) on Windows or `python3` elsewhere, found through PATH.
+fn python_command() -> std::ffi::OsString {
+    match std::env::var_os("TRANSLATOR_PYTHON") {
+        Some(path) if !path.is_empty() => path,
+        _ if cfg!(target_os = "windows") => "pythonw.exe".into(),
+        _ => "python3".into(),
+    }
+}
+
 impl WhisperSttSession {
     pub fn new(sample_rate: u32, model_name: &str) -> Result<Self> {
         let script_path = std::env::current_dir()
             .unwrap_or_default()
             .join("whisper_worker.py");
 
-        let mut cmd = Command::new(r"C:\Program Files\Python312\pythonw.exe");
+        let mut cmd = Command::new(python_command());
         cmd.arg(script_path.to_string_lossy().replace('\\', "\\\\"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -209,4 +219,18 @@ fn read_msg(r: &mut BufReader<Box<dyn Read + Send>>) -> Result<serde_json::Value
 fn base64_enc(data: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_command_prefers_the_override() {
+        std::env::set_var("TRANSLATOR_PYTHON", "/opt/py/python");
+        assert_eq!(python_command(), std::ffi::OsString::from("/opt/py/python"));
+        std::env::remove_var("TRANSLATOR_PYTHON");
+        let default = python_command();
+        assert!(default == "pythonw.exe" || default == "python3");
+    }
 }

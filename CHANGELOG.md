@@ -27,6 +27,8 @@
 - Windows paths are derived from `%APPDATA%` instead of a fixed user directory.
 - Auto translation mode asks Groq first and calls LiteLLM and Yandex only when Groq fails or stays silent for 6 s (previously all three ran on every utterance).
 - The `local-mt` feature now enables its `ct2rs` dependency and builds on Windows (needs `RUSTFLAGS="-C target-feature=+crt-static"`).
+- A dropped Deepgram connection no longer loses the phrase being spoken: the last interim text goes to the processor as a final result, and the first reconnect retry waits 300 ms instead of 2 s.
+- The Whisper worker is started through `TRANSLATOR_PYTHON`, or `pythonw.exe`/`python3` from PATH, instead of a fixed `C:\Program Files\Python312` path.
 - Removed `JobQueue`: stale-job checks could never fire because jobs run one at a time, so nothing was cancelled.
 
 ### Added
