@@ -124,7 +124,7 @@ cargo build --release --bin audio_engine
 который требует крейт `ct2rs`:
 
 ```bat
-set "CARGO_TARGET_DIR=C:	\lm"
+set "CARGO_TARGET_DIR=C:\t\lm"
 set "RUSTFLAGS=-C target-feature=+crt-static"
 cargo build --release --features local-mt --bin audio_engine
 ```
