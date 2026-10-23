@@ -119,6 +119,19 @@ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliar
 cargo build --release --bin audio_engine
 ```
 
+Для локальной модели перевода (фича `local-mt`, CTranslate2) нужны два отличия. Сборка идёт из
+короткого каталога, иначе MSVC не создаёт лог-файлы на длинном пути worktree, и с статическим CRT,
+который требует крейт `ct2rs`:
+
+```bat
+set "CARGO_TARGET_DIR=C:	\lm"
+set "RUSTFLAGS=-C target-feature=+crt-static"
+cargo build --release --features local-mt --bin audio_engine
+```
+
+Без `RUSTFLAGS` линковка падает с LNK2038. Загрузка самой модели этими тестами не проверяется:
+нужны файлы `model.bin`, `source.spm` и `target.spm`.
+
 ## Оценка промпта Groq
 
 `tests/e2e/prompt_eval.py` прогоняет 28 фраз (RU→EN и EN→RU, с эталонами) через кандидатов
