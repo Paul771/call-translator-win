@@ -37,6 +37,9 @@ fn groq_system_prompt(from_name: &str, to_name: &str) -> String {
 /// `model_not_found`), which is why the model is configurable.
 const DEFAULT_GROQ_MODEL: &str = "openai/gpt-oss-20b";
 
+/// How long auto mode waits for Groq before it starts the fallbacks.
+const GROQ_FIRST_LIMIT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// Chat-completions body for one translation. Reasoning models (gpt-oss) spend completion
 /// tokens on thinking before the answer, so they get `reasoning_effort: low` and a larger
 /// budget; with the old 40 tokens they return an empty reply.
@@ -208,67 +211,61 @@ impl TranslationEngine {
                 #[cfg(not(feature = "local-mt"))]
                 bail!("Local MT selected but binary was built without 'local-mt' feature")
             }
-            _ => {} // "auto" — hedge all available providers, first success wins
+            _ => {} // "auto" — Groq first, then LiteLLM and Yandex only on failure
         }
 
-        // Auto mode: launch Groq immediately, LiteLLM and Yandex with staggered start.
-        // Accept the first successful response.
+        // Auto mode: Groq first. LiteLLM, then Yandex, run only when the previous provider
+        // fails or stays silent for GROQ_FIRST_LIMIT. The engine allows the whole translation
+        // 12 s, so a hung Groq must not use that budget before the fallbacks get a turn.
         let has_groq = self.groq_key.len() > 4;
         let has_litellm = self.litellm_api_key.len() > 2 && !self.litellm_base_url.is_empty();
         let has_yandex = self.yandex_key.len() > 4;
 
-        let total_tasks = has_groq as usize + has_litellm as usize + has_yandex as usize;
-        if total_tasks == 0 {
+        if !(has_groq || has_litellm || has_yandex) {
             bail!("No valid API keys available for translation");
         }
 
-        let (tx, rx) = std::sync::mpsc::channel::<(String, Result<String>)>();
+        let mut last_err: Option<anyhow::Error> = None;
 
         if has_groq {
-            let tx = tx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
             let s = self.clone();
             let t = text.to_string();
             let d = direction.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(("groq".into(), s.translate_groq(&t, &d)));
+                let _ = tx.send(s.translate_groq(&t, &d));
             });
+            match rx.recv_timeout(GROQ_FIRST_LIMIT) {
+                Ok(Ok(translated)) => {
+                    eprintln!("[AUTO] Groq answered: '{}'", translated);
+                    return Ok((translated, provider_tag("groq")));
+                }
+                Ok(Err(e)) => last_err = Some(log_auto_failure("groq", e)),
+                Err(_) => {
+                    last_err = Some(log_auto_failure("groq", anyhow::anyhow!(
+                        "no answer within {}s", GROQ_FIRST_LIMIT.as_secs()
+                    )))
+                }
+            }
         }
-        if has_litellm {
-            let tx = tx.clone();
-            let s = self.clone();
-            let t = text.to_string();
-            let d = direction.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                let _ = tx.send(("litellm".into(), s.translate_litellm(&t, &d)));
-            });
-        }
-        if has_yandex {
-            let tx = tx.clone();
-            let s = self.clone();
-            let t = text.to_string();
-            let d = direction.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                let _ = tx.send(("yandex".into(), s.translate_yandex_raw(&t, &d)));
-            });
-        }
-        // Drop the original sender so rx.iter() terminates once all threads finish.
-        drop(tx);
 
-        let mut last_err = None;
-        for (provider, result) in rx {
-            match result {
+        if has_litellm {
+            match self.translate_litellm(text, direction) {
                 Ok(translated) => {
-                    eprintln!("[AUTO] First response from {}: '{}'", provider, translated);
-                    return Ok((translated, provider));
+                    eprintln!("[AUTO] LiteLLM answered: '{}'", translated);
+                    return Ok((translated, provider_tag("litellm")));
                 }
-                Err(e) => {
-                    let err_line = format!("[FALLBACK] {} failed: {:#}", provider, e);
-                    eprintln!("{}", err_line);
-                    log_to_file("groq_debug.log", &err_line);
-                    last_err = Some(e);
+                Err(e) => last_err = Some(log_auto_failure("litellm", e)),
+            }
+        }
+
+        if has_yandex {
+            match self.translate_yandex_raw(text, direction) {
+                Ok(translated) => {
+                    eprintln!("[AUTO] Yandex answered: '{}'", translated);
+                    return Ok((translated, provider_tag("yandex")));
                 }
+                Err(e) => last_err = Some(log_auto_failure("yandex", e)),
             }
         }
 
@@ -277,26 +274,28 @@ impl TranslationEngine {
 
     #[cfg(feature = "local-mt")]
     fn translate_local_mt(&self, text: &str, direction: &TranslationDirection) -> Result<(String, String)> {
-        let model = if direction.from_code == "ru" && direction.to_code == "en" {
-            &self.mt_ruen
+        let (cell, path) = if direction.from_code == "ru" && direction.to_code == "en" {
+            (&self.mt_ruen, &self.mt_ruen_path)
         } else if direction.from_code == "en" && direction.to_code == "ru" {
-            &self.mt_enru
+            (&self.mt_enru, &self.mt_enru_path)
         } else {
-            anyhow::bail!("Local MT not available for {}→{}", direction.from_code, direction.to_code);
+            bail!("Local MT not available for {}→{}", direction.from_code, direction.to_code);
         };
 
-        let mt = model.get_or_init(|| {
-            let path = if direction.from_code == "ru" {
-                &self.mt_ruen_path
-            } else {
-                &self.mt_enru_path
-            };
-            if path.is_empty() {
-                panic!("Local MT model path not configured");
+        // An unconfigured or broken model is an ordinary translation error, not a panic
+        // in the worker thread.
+        let mt = match cell.get() {
+            Some(loaded) => loaded,
+            None => {
+                if path.is_empty() {
+                    bail!("Local MT model path not configured for {}→{}", direction.from_code, direction.to_code);
+                }
+                let loaded = model::TranslationModel::new(std::path::Path::new(path))
+                    .with_context(|| format!("Failed to load local MT model from {}", path))?;
+                let _ = cell.set(loaded);
+                cell.get().context("Local MT model was not stored")?
             }
-            model::TranslationModel::new(std::path::Path::new(path))
-                .expect("Failed to load local MT model")
-        });
+        };
 
         let result = mt.translate(text)?;
         eprintln!("[LOCAL_MT] {}→{}: '{}' → '{}'", direction.from_code, direction.to_code, text, result);
@@ -478,6 +477,14 @@ fn clean_groq_output(text: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// Record a failed auto-mode provider in the same places the old parallel race did.
+fn log_auto_failure(provider: &str, e: anyhow::Error) -> anyhow::Error {
+    let line = format!("[FALLBACK] {} failed: {:#}", provider, e);
+    eprintln!("{}", line);
+    log_to_file("groq_debug.log", &line);
+    e
 }
 
 fn log_to_file(filename: &str, line: &str) {

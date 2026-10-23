@@ -8,7 +8,7 @@
     <note>Reviewed merged origin/master (W1-W3 latency waves). Items below are architectural defects that were intentionally deferred. Fixes 1-2 (reconnect chain, segmenter reset) already applied.</note>
   </Context>
 
-  <Fix id="DF-3" PRIORITY="medium" STATUS="pending">
+  <Fix id="DF-3" PRIORITY="medium" STATUS="done">
     <title>JobQueue does not actually cancel stale work</title>
     <file>native/audio_engine/src/engine.rs</file>
     <file>native/audio_engine/src/pipeline/job_queue.rs</file>
@@ -27,7 +27,7 @@
     </verification>
   </Fix>
 
-  <Fix id="DF-4" PRIORITY="medium" STATUS="pending">
+  <Fix id="DF-4" PRIORITY="medium" STATUS="done">
     <title>Whisper worker hardcodes 16000 Hz sample rate</title>
     <file>whisper_worker.py</file>
     <file>native/audio_engine/src/stt/whisper_stt.rs</file>
@@ -43,7 +43,7 @@
     </fix-direction>
   </Fix>
 
-  <Fix id="DF-5" PRIORITY="high" STATUS="pending">
+  <Fix id="DF-5" PRIORITY="high" STATUS="done">
     <title>Whisper worker: no error handling — silent worker death</title>
     <file>whisper_worker.py</file>
     <problem>
@@ -57,7 +57,7 @@
     </fix-direction>
   </Fix>
 
-  <Fix id="DF-6" PRIORITY="medium" STATUS="pending">
+  <Fix id="DF-6" PRIORITY="medium" STATUS="done">
     <title>local_first preset can panic on unconfigured local MT</title>
     <file>lib/translator/audio_engine.ex</file>
     <file>native/audio_engine/src/translation/mod.rs</file>
@@ -75,7 +75,7 @@
     </fix-direction>
   </Fix>
 
-  <Fix id="DF-7" PRIORITY="low" STATUS="pending">
+  <Fix id="DF-7" PRIORITY="low" STATUS="done">
     <title>Hedge translation burns quota x3 in auto mode</title>
     <file>native/audio_engine/src/translation/mod.rs</file>
     <problem>
@@ -86,6 +86,35 @@
     <fix-direction>
       Consider staggered priorities (Groq first, fallbacks only on failure)
       or a per-utterance concurrency budget; measure quota impact first.
+    </fix-direction>
+  </Fix>
+  <Fix id="DF-8" PRIORITY="medium" STATUS="done">
+    <title>Windows paths are hardcoded in the Elixir orchestrator</title>
+    <file>lib/translator/audio_engine.ex</file>
+    <problem>
+      `base_dir` and `ORT_DYLIB_PATH` are fixed to `C:/Users/Pavel/AppData/Roaming/npm/call-translator-win`
+      (lines around 250, 277 and 326). Any other user gets a wrong engine or onnxruntime path.
+    </problem>
+    <fix-direction>
+      Derive the base directory from the install location (or an env var) and the onnxruntime path
+      from `ORT_DYLIB_PATH` in `.env`, with no per-user default.
+    </fix-direction>
+  </Fix>
+  <Fix id="DF-9" PRIORITY="medium" STATUS="done">
+    <title>Feature local-mt cannot be compiled</title>
+    <file>native/audio_engine/Cargo.toml</file>
+    <file>native/audio_engine/src/translation/model.rs</file>
+    <problem>
+      `local-mt = []` declares no dependencies, but the module imports `ct2rs`,
+      which is not in Cargo.toml. `cargo check --features local-mt` fails with
+      unresolved import `ct2rs`. Code behind the feature is therefore never compiled
+      in CI or by hand, and DF-6 changes to translate_local_mt are unverified by the compiler.
+    </problem>
+    <fix-direction>
+      Done: local-mt = ["dep:ct2rs"]. Building it needs RUSTFLAGS="-C target-feature=+crt-static"
+      (ct2rs build.rs forces the static CRT for its C++ part; without the flag link fails with LNK2038).
+      Also needs a short target dir (CARGO_TARGET_DIR=C:\t\lm) because MSVC FileTracker fails on the long worktree path.
+      Verified: cargo test --features local-mt 30/30. Model loading is not exercised (no model files here).
     </fix-direction>
   </Fix>
 </DeferredFixes>

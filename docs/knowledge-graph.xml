@@ -28,7 +28,7 @@
     </M-STT>
 
     <M-TRANSLATION NAME="Translation" TYPE="INTEGRATION" STATUS="implemented">
-      <purpose>Text translation: Groq→LiteLLM→Yandex fallback, with planned local CTranslate2-based translation for low-latency mode</purpose>
+      <purpose>Text translation. Auto mode is a hedged race of the configured providers (Groq starts at once, Yandex 300 ms later, first success wins). Groq model is set by GROQ_MODEL (default openai/gpt-oss-20b); its system prompt lives in translation/groq_prompt.txt. Planned: local CTranslate2-based translation for low-latency mode</purpose>
       <path>native/audio_engine/src/translation/</path>
       <depends>none</depends>
       <verification-ref>V-M-TRANSLATION</verification-ref>

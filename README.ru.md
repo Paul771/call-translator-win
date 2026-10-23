@@ -80,7 +80,7 @@ cd call-translator
 
 **API-ключи (есть бесплатные тарифы):**
 - [Deepgram](https://console.deepgram.com) — распознавание речи (модель Nova-3)
-- [Groq](https://console.groq.com) — перевод через llama-3.3-70b
+- [Groq](https://console.groq.com) — перевод через `openai/gpt-oss-20b` (меняется переменной `GROQ_MODEL`)
 
 ---
 
