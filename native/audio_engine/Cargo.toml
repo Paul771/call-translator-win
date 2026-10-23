@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = []
 directml = []
-local-mt = []
+local-mt = ["dep:ct2rs"]
 
 [[bin]]
 name = "test_onnx_session"

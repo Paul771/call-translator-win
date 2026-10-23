@@ -100,7 +100,7 @@
       from `ORT_DYLIB_PATH` in `.env`, with no per-user default.
     </fix-direction>
   </Fix>
-  <Fix id="DF-9" PRIORITY="medium" STATUS="pending">
+  <Fix id="DF-9" PRIORITY="medium" STATUS="done">
     <title>Feature local-mt cannot be compiled</title>
     <file>native/audio_engine/Cargo.toml</file>
     <file>native/audio_engine/src/translation/model.rs</file>
@@ -111,8 +111,10 @@
       in CI or by hand, and DF-6 changes to translate_local_mt are unverified by the compiler.
     </problem>
     <fix-direction>
-      Add ct2rs as an optional dependency enabled by local-mt, or remove the feature and
-      its code. Then run cargo check with and without the feature.
+      Done: local-mt = ["dep:ct2rs"]. Building it needs RUSTFLAGS="-C target-feature=+crt-static"
+      (ct2rs build.rs forces the static CRT for its C++ part; without the flag link fails with LNK2038).
+      Also needs a short target dir (CARGO_TARGET_DIR=C:\t\lm) because MSVC FileTracker fails on the long worktree path.
+      Verified: cargo test --features local-mt 30/30. Model loading is not exercised (no model files here).
     </fix-direction>
   </Fix>
 </DeferredFixes>
